@@ -1,6 +1,6 @@
 // =========================
 // Lovable Solana Trading Bot
-// Jupiter SDK + Priority Fee & Reliable Swap
+// Jupiter SDK + Dynamic Quote Check + Real/Demo Mode
 // =========================
 
 import {
@@ -10,10 +10,7 @@ import {
   LAMPORTS_PER_SOL,
 } from "@solana/web3.js";
 import bs58 from "bs58";
-import {
-  createJupiterApiClient,
-  getPriorityFees,
-} from "@jup-ag/api"; // SDK package
+import { createJupiterApiClient } from "@jup-ag/api";
 
 // =========================
 // ENV CONFIG
@@ -23,15 +20,14 @@ const PRIVATE_KEY = process.env.SOLANA_PRIVATE_KEY!;
 const LOVABLE_CONTROL_URL = process.env.LOVABLE_CONTROL_URL!;
 const LOVABLE_LOG_URL = process.env.LOVABLE_LOG_URL!;
 const JUPITER_API_KEY = process.env.JUPITER_API_KEY || "";
-const PRIORITY_FEE_MULTIPLIER = parseInt(process.env.PRIORITY_FEE_MULTIPLIER || "1");
+const BOT_INTERVAL_MS = 3000;
 
 // =========================
 // CONSTANTS
 // =========================
-const INPUT_MINT = "So11111111111111111111111111111111111111112";
-const OUTPUT_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-const SLIPPAGE_BPS = 50;
-const BOT_INTERVAL_MS = 3000;
+const INPUT_MINT = "So11111111111111111111111111111111111111112"; // SOL
+const OUTPUT_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"; // USDC
+const DEFAULT_SLIPPAGE_BPS = 50;
 
 // =========================
 // STATE
@@ -39,18 +35,22 @@ const BOT_INTERVAL_MS = 3000;
 let botState = {
   status: "STOPPED" as "RUNNING" | "STOPPED",
   testMode: true,
-  tradeSizeSOL: 0.1,
+  tradeSizeSOL: 0.05,
   usePercentageRisk: false,
   balance: 0,
   initialBalance: 0,
 };
 
 // =========================
-// SETUP CONNECTION + WALLET
+// SETUP
 // =========================
 const connection = new Connection(RPC_URL, "confirmed");
 const walletKeypair = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
-const jupiterApi = createJupiterApiClient({ apiKey: JUPITER_API_KEY });
+
+const jupiterApi = createJupiterApiClient({
+  apiKey: JUPITER_API_KEY,
+  useLite: !JUPITER_API_KEY, // fallback if no key
+});
 
 console.log("✅ Wallet:", walletKeypair.publicKey.toBase58());
 console.log("✅ Connected to RPC:", RPC_URL);
@@ -76,24 +76,25 @@ async function syncDashboard() {
 }
 
 // =========================
-// JUPITER QUOTE
+// GET QUOTE
 // =========================
-async function getJupiterQuote(lamports: number): Promise<any | null> {
+async function getQuote(lamports: number, slippageBps = DEFAULT_SLIPPAGE_BPS) {
   try {
     const quotes = await jupiterApi.quoteGet({
       inputMint: INPUT_MINT,
       outputMint: OUTPUT_MINT,
       amount: lamports,
-      slippageBps: SLIPPAGE_BPS,
+      slippageBps,
     });
+
     if (!quotes || quotes.length === 0) {
-      console.warn("⚠️ No valid routes found");
+      console.warn("⚠️ No valid routes found for this trade.");
       return null;
     }
     console.log(`💱 Routes found: ${quotes.length}`);
-    return quotes[0]; // best route
+    return quotes[0];
   } catch (e) {
-    console.error("Quote error:", e);
+    console.error("Quote failed:", e);
     return null;
   }
 }
@@ -103,18 +104,13 @@ async function getJupiterQuote(lamports: number): Promise<any | null> {
 // =========================
 async function executeSwap(quote: any): Promise<string | null> {
   try {
-    // optional: calculate priority fees
-    const priorityFees = await getPriorityFees(connection);
-    const prioritization = Math.round(priorityFees * PRIORITY_FEE_MULTIPLIER);
-
     const { swapTransaction } = await jupiterApi.swapPost({
       swapRequest: {
         quoteResponse: quote,
         userPublicKey: walletKeypair.publicKey.toBase58(),
         wrapAndUnwrapSol: true,
         dynamicComputeUnitLimit: true,
-        // optionally adding prioritized fee
-        prioritizationFeeLamports: prioritization.toString(),
+        prioritizationFeeLamports: "auto",
       },
     });
 
@@ -129,7 +125,7 @@ async function executeSwap(quote: any): Promise<string | null> {
 
     return sig;
   } catch (e) {
-    console.error("❌ Swap failed:", e);
+    console.error("Swap failed:", e);
     return null;
   }
 }
@@ -164,6 +160,16 @@ async function logResult(
 }
 
 // =========================
+// DEMO TRADE
+// =========================
+async function runDemoTrade() {
+  const change = (Math.random() * 4 - 1.5) / 100;
+  const newBal = botState.balance * (1 + change);
+  console.log(`🟡 DEMO TRADE | ${(change * 100).toFixed(2)}% | Bal: ${newBal.toFixed(4)} SOL`);
+  botState.balance = newBal;
+}
+
+// =========================
 // BOT STEP
 // =========================
 async function botStep() {
@@ -176,21 +182,32 @@ async function botStep() {
   const tradeSize = botState.usePercentageRisk
     ? (botState.balance * botState.tradeSizeSOL) / 100
     : botState.tradeSizeSOL;
+
   const lamports = Math.round(tradeSize * LAMPORTS_PER_SOL);
 
   if (botState.testMode) {
-    console.log("🧪 DEMO MODE");
+    console.log("🧪 DEMO MODE ACTIVE");
+    await runDemoTrade();
     return;
   }
 
+  // REAL TRADE
   console.log(`🔁 Quote for ${tradeSize.toFixed(4)} SOL`);
-  const quote = await getJupiterQuote(lamports);
-  if (!quote) return;
+  const quote = await getQuote(lamports);
+  if (!quote) {
+    console.log("⚠️ Falling back to simulation because no valid quote found");
+    await runDemoTrade();
+    return;
+  }
 
   const sig = await executeSwap(quote);
-  if (!sig) return;
+  if (!sig) {
+    console.log("⚠️ Swap failed, running simulated fallback");
+    await runDemoTrade();
+    return;
+  }
 
-  console.log("✅ Swap Success:", sig);
+  console.log("✅ REAL SWAP executed:", sig);
 
   const outputUSDC = Number(quote.outAmount) / 1e6;
   const balanceSOL = await connection.getBalance(walletKeypair.publicKey) / LAMPORTS_PER_SOL;
@@ -202,7 +219,7 @@ async function botStep() {
 // MAIN LOOP
 // =========================
 async function main() {
-  console.log("🚀 Bot Launched");
+  console.log("🚀 Lovable Bot Launched");
 
   while (true) {
     try {

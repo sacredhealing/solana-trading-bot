@@ -140,7 +140,7 @@ async function syncWithDashboard(): Promise<void> {
 // =========================
 async function getQuote(amountLamports: number): Promise<JupiterQuoteResponse | null> {
   try {
-    const url = `https://quote-api.jup.ag/v6/quote?inputMint=${INPUT_MINT}&outputMint=${OUTPUT_MINT}&amount=${amountLamports}&slippageBps=${SLIPPAGE_BPS}`;
+    const url = `https://public.jupiterapi.com/v6/quote?inputMint=${INPUT_MINT}&outputMint=${OUTPUT_MINT}&amount=${amountLamports}&slippageBps=${SLIPPAGE_BPS}`;
     const response = await fetch(url);
     const data = await response.json() as JupiterQuoteResponse;
     

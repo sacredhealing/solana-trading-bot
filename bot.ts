@@ -1,6 +1,6 @@
 // =========================
 // Lovable Solana Trading Bot
-// Jupiter SDK + Dynamic Quote Check + Real/Demo Mode
+// Jupiter SDK + Corrected Quote → Swap Flow
 // =========================
 
 import {
@@ -49,7 +49,7 @@ const walletKeypair = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
 
 const jupiterApi = createJupiterApiClient({
   apiKey: JUPITER_API_KEY,
-  useLite: !JUPITER_API_KEY, // fallback if no key
+  useLite: !JUPITER_API_KEY,
 });
 
 console.log("✅ Wallet:", walletKeypair.publicKey.toBase58());
@@ -91,10 +91,14 @@ async function getQuote(lamports: number, slippageBps = DEFAULT_SLIPPAGE_BPS) {
       console.warn("⚠️ No valid routes found for this trade.");
       return null;
     }
-    console.log(`💱 Routes found: ${quotes.length}`);
+
+    // Log all routes for debugging
+    console.log("DEBUG: Quote routes:", quotes);
+
+    // Always pick the first route for swap
     return quotes[0];
   } catch (e) {
-    console.error("Quote failed:", e);
+    console.error("Jupiter quote error:", e);
     return null;
   }
 }
@@ -104,7 +108,7 @@ async function getQuote(lamports: number, slippageBps = DEFAULT_SLIPPAGE_BPS) {
 // =========================
 async function executeSwap(quote: any): Promise<string | null> {
   try {
-    const { swapTransaction } = await jupiterApi.swapPost({
+    const swapResponse = await jupiterApi.swapPost({
       swapRequest: {
         quoteResponse: quote,
         userPublicKey: walletKeypair.publicKey.toBase58(),
@@ -114,7 +118,12 @@ async function executeSwap(quote: any): Promise<string | null> {
       },
     });
 
+    const { swapTransaction } = swapResponse;
+
     if (!swapTransaction) throw new Error("No swap transaction returned");
+
+    // Log swap response for debugging
+    console.log("DEBUG: Swap response", swapResponse);
 
     const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, "base64"));
     tx.sign([walletKeypair]);
@@ -125,7 +134,7 @@ async function executeSwap(quote: any): Promise<string | null> {
 
     return sig;
   } catch (e) {
-    console.error("Swap failed:", e);
+    console.error("Jupiter swap error:", e);
     return null;
   }
 }
@@ -192,10 +201,10 @@ async function botStep() {
   }
 
   // REAL TRADE
-  console.log(`🔁 Quote for ${tradeSize.toFixed(4)} SOL`);
+  console.log(`🔁 Fetching quote for ${tradeSize.toFixed(4)} SOL`);
   const quote = await getQuote(lamports);
   if (!quote) {
-    console.log("⚠️ Falling back to simulation because no valid quote found");
+    console.log("⚠️ Falling back to simulation: no valid quote");
     await runDemoTrade();
     return;
   }
@@ -219,7 +228,7 @@ async function botStep() {
 // MAIN LOOP
 // =========================
 async function main() {
-  console.log("🚀 Lovable Bot Launched");
+  console.log("🚀 Lovable Bot Launched - Correct Jupiter Flow");
 
   while (true) {
     try {

@@ -37,6 +37,8 @@ interface ControlStatus {
   testMode: boolean;
   balance: number;
   initialBalance: number;
+  lastSignal?: string;
+  regime?: string;
 }
 
 // =========================
@@ -51,7 +53,7 @@ let botState = {
   losses: 0,
   regime: "HOT" as "HOT" | "WARM" | "COLD",
   status: "STOPPED" as "RUNNING" | "STOPPED",
-  last_signal: "WAIT" as "BUY" | "WAIT" | "EXIT",
+  last_signal: "WAIT" as "BUY" | "WAIT" | "EXIT" | "SELL",
   testMode: false,
   tradeSizeSOL: 0.1,
   usePercentageRisk: false,
@@ -134,6 +136,13 @@ async function syncWithDashboard(): Promise<void> {
   botState.testMode = control.testMode;
   botState.balance = control.balance;
   botState.initialBalance = control.initialBalance;
+  // Use signal from dashboard if provided
+  if (control.lastSignal) {
+    botState.last_signal = control.lastSignal as "BUY" | "WAIT" | "EXIT" | "SELL";
+  }
+  if (control.regime) {
+    botState.regime = control.regime as "HOT" | "WARM" | "COLD";
+  }
 }
 
 // =========================
@@ -189,6 +198,50 @@ async function getQuote(amountLamports: number): Promise<any | null> {
     console.error("❌ Failed to get quote:", errMsg);
     botState.lastJupiterError = errMsg;
     botState.jupiterOnline = false;
+    return null;
+  }
+}
+
+async function getQuoteReverse(): Promise<any | null> {
+  try {
+    // Get USDC balance to swap back to SOL
+    const usdcMint = OUTPUT_MINT;
+    const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
+      walletKeypair.publicKey,
+      { mint: new (await import("@solana/web3.js")).PublicKey(usdcMint) }
+    );
+    
+    if (tokenAccounts.value.length === 0) {
+      console.log("⚠️ No USDC balance found");
+      return null;
+    }
+    
+    const usdcBalance = tokenAccounts.value[0].account.data.parsed.info.tokenAmount.amount;
+    if (parseInt(usdcBalance) < 1000000) { // Less than 1 USDC
+      console.log("⚠️ USDC balance too low to swap");
+      return null;
+    }
+    
+    const params = {
+      inputMint: OUTPUT_MINT, // USDC
+      outputMint: INPUT_MINT, // SOL
+      amount: parseInt(usdcBalance),
+      slippageBps: SLIPPAGE_BPS,
+    };
+    console.log(`📡 Requesting reverse quote for ${parseInt(usdcBalance) / 1_000_000} USDC...`);
+    const quote = await jupiterApi.quoteGet(params);
+    if ('error' in quote) {
+      const errMsg = JSON.stringify(quote);
+      console.error("❌ Reverse quote error:", errMsg);
+      botState.lastJupiterError = errMsg;
+      return null;
+    }
+    console.log(`✅ Reverse quote received: ${parseInt(quote.outAmount) / LAMPORTS_PER_SOL} SOL`);
+    return quote;
+  } catch (error: any) {
+    const errMsg = error?.message || String(error);
+    console.error("❌ Failed to get reverse quote:", errMsg);
+    botState.lastJupiterError = errMsg;
     return null;
   }
 }
@@ -328,19 +381,16 @@ async function botStep(): Promise<void> {
   if (botState.status !== "RUNNING") {
     return;
   }
-  // Generate regime
-  const regimes: Array<"HOT" | "WARM" | "COLD"> = ["HOT", "WARM", "COLD"];
-  botState.regime = regimes[Math.floor(Math.random() * regimes.length)];
-  // Generate signal
-  const signals: Array<"BUY" | "WAIT" | "EXIT"> = ["BUY", "WAIT", "EXIT"];
-  botState.last_signal = signals[Math.floor(Math.random() * signals.length)];
+  
   const timestamp = new Date().toLocaleTimeString();
-  // Execute trade if conditions met
+  
+  // Execute trade based on signal from dashboard
   if (botState.last_signal === "BUY" && botState.regime !== "COLD") {
+    // BUY signal: Swap SOL → USDC
     const tradeSize = calculateTradeSize();
     const amountLamports = Math.round(tradeSize * LAMPORTS_PER_SOL);
    
-    console.log(`[${timestamp}] 📊 Attempting trade: ${tradeSize.toFixed(4)} SOL`);
+    console.log(`[${timestamp}] 📊 BUY Signal: Swapping ${tradeSize.toFixed(4)} SOL → USDC`);
     const quote = await getQuote(amountLamports);
     if (quote) {
       const result = await executeSwap(quote);
@@ -353,10 +403,7 @@ async function botStep(): Promise<void> {
         botState.wins++;
         await logToLovable(result.txSig, tradeSize, outputUSDC, balanceSOL, "success");
       } else {
-        // Log the actual error instead of just showing "Jupiter unavailable"
         console.log(`[${timestamp}] 🔴 SWAP FAILED | Error: ${result.error || botState.lastJupiterError}`);
-        
-        // Only fallback to simulation if testMode is enabled
         if (botState.testMode) {
           const change = (Math.random() * 5 - 2) / 100;
           const newBalance = botState.balance * (1 + change);
@@ -370,6 +417,30 @@ async function botStep(): Promise<void> {
       }
     } else {
       console.log(`[${timestamp}] ⚠️ Could not get quote | Last error: ${botState.lastJupiterError}`);
+    }
+  } else if (botState.last_signal === "EXIT" || botState.last_signal === "SELL") {
+    // EXIT/SELL signal: Swap USDC → SOL
+    console.log(`[${timestamp}] 📊 EXIT Signal: Swapping USDC → SOL`);
+    const quote = await getQuoteReverse();
+    if (quote) {
+      const result = await executeSwap(quote);
+      if (result.success && result.txSig) {
+        const inputUSDC = parseInt(quote.inAmount) / 1_000_000;
+        const outputSOL = parseInt(quote.outAmount) / LAMPORTS_PER_SOL;
+        const balanceSOL = await connection.getBalance(walletKeypair.publicKey) / LAMPORTS_PER_SOL;
+        console.log(`[${timestamp}] 🟢 LIVE SWAP | ${inputUSDC.toFixed(2)} USDC → ${outputSOL.toFixed(4)} SOL`);
+        console.log(`[${timestamp}] 📝 TX: https://solscan.io/tx/${result.txSig}`);
+        botState.trades++;
+        botState.wins++;
+        await logToLovable(result.txSig, inputUSDC, outputSOL, balanceSOL, "success");
+      } else {
+        console.log(`[${timestamp}] 🔴 SWAP FAILED | Error: ${result.error || botState.lastJupiterError}`);
+        botState.trades++;
+        botState.losses++;
+        await logToLovable("failed", 0, 0, botState.balance, "failed");
+      }
+    } else {
+      console.log(`[${timestamp}] ⚠️ Could not get reverse quote | Last error: ${botState.lastJupiterError}`);
     }
   } else {
     console.log(`[${timestamp}] ⚪ Signal: ${botState.last_signal} | Regime: ${botState.regime} | Waiting...`);

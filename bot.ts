@@ -9,7 +9,7 @@ import {
   LAMPORTS_PER_SOL,
 } from "@solana/web3.js";
 import bs58 from "bs58";
-import { createJupiterApiClient, QuoteGetRequest, SwapPostRequest } from '@jup-ag/api';
+import { createJupiterApiClient } from '@jup-ag/api';
 
 // =========================
 // CONFIGURATION
@@ -135,7 +135,7 @@ async function syncWithDashboard(): Promise<void> {
 async function checkJupiterHealth(): Promise<boolean> {
   try {
     // Test with a minimal quote request to verify Jupiter API is responding
-    const testParams: QuoteGetRequest = {
+    const testParams = {
       inputMint: INPUT_MINT,
       outputMint: OUTPUT_MINT,
       amount: 1000000, // 0.001 SOL in lamports
@@ -159,7 +159,7 @@ async function checkJupiterHealth(): Promise<boolean> {
 
 async function getQuote(amountLamports: number): Promise<any | null> {
   try {
-    const params: QuoteGetRequest = {
+    const params = {
       inputMint: INPUT_MINT,
       outputMint: OUTPUT_MINT,
       amount: amountLamports,
@@ -189,7 +189,7 @@ async function getQuote(amountLamports: number): Promise<any | null> {
 async function executeSwap(quote: any): Promise<{ success: boolean; txSig?: string; error?: string }> {
   try {
     console.log(`🔄 Preparing swap transaction...`);
-    const params: SwapPostRequest = {
+    const params = {
       swapRequest: {
         quoteResponse: quote,
         userPublicKey: walletKeypair.publicKey.toBase58(),

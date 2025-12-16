@@ -194,6 +194,7 @@ async function getQuote(amountLamports: number): Promise<any | null> {
 }
 
 async function executeSwap(quote: any): Promise<{ success: boolean; txSig?: string; error?: string }> {
+  let txSig: string | undefined;
   try {
     console.log(`🔄 Preparing swap transaction...`);
     const params = {
@@ -222,20 +223,34 @@ async function executeSwap(quote: any): Promise<{ success: boolean; txSig?: stri
     transaction.sign([walletKeypair]);
     
     console.log(`📤 Broadcasting transaction to Solana...`);
-    const txSig = await connection.sendRawTransaction(transaction.serialize(), {
+    txSig = await connection.sendRawTransaction(transaction.serialize(), {
       skipPreflight: false,
       maxRetries: 3,
     });
     console.log(`⏳ Confirming transaction: ${txSig}`);
+    console.log(`🔗 Track: https://solscan.io/tx/${txSig}`);
     
+    // Transaction sent - even if confirmation times out, check on-chain
     const latestBlockhash = await connection.getLatestBlockhash();
-    await connection.confirmTransaction({
-      signature: txSig,
-      blockhash: latestBlockhash.blockhash,
-      lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
-    });
+    try {
+      await connection.confirmTransaction({
+        signature: txSig,
+        blockhash: latestBlockhash.blockhash,
+        lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+      }, "confirmed");
+      console.log(`✅ Transaction confirmed!`);
+    } catch (confirmError: any) {
+      // Confirmation timed out but tx may have succeeded - check status
+      console.log(`⚠️ Confirmation timeout, checking transaction status...`);
+      const status = await connection.getSignatureStatus(txSig);
+      if (status?.value?.confirmationStatus === "confirmed" || status?.value?.confirmationStatus === "finalized") {
+        console.log(`✅ Transaction actually succeeded!`);
+      } else {
+        console.log(`⚠️ Transaction status uncertain: ${JSON.stringify(status?.value)}`);
+        // Still return success since tx was broadcast - user should verify on-chain
+      }
+    }
     
-    console.log(`✅ Transaction confirmed!`);
     return { success: true, txSig };
   } catch (error: any) {
     const errMsg = error?.message || String(error);

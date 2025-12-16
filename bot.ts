@@ -54,6 +54,8 @@ let botState = {
   testMode: false,
   tradeSizeSOL: 0.1,
   usePercentageRisk: false,
+  jupiterOnline: false,
+  lastJupiterError: "" as string,
 };
 
 // =========================
@@ -128,9 +130,34 @@ async function syncWithDashboard(): Promise<void> {
 }
 
 // =========================
-// JUPITER FUNCTIONS
+// JUPITER HEALTH CHECK & FUNCTIONS
 // =========================
-async function getQuote(amountLamports: number): Promise<any | null> {  // Use 'any' or library's QuoteResponse type
+async function checkJupiterHealth(): Promise<boolean> {
+  try {
+    // Test with a minimal quote request to verify Jupiter API is responding
+    const testParams: QuoteGetRequest = {
+      inputMint: INPUT_MINT,
+      outputMint: OUTPUT_MINT,
+      amount: 1000000, // 0.001 SOL in lamports
+      slippageBps: SLIPPAGE_BPS,
+    };
+    const quote = await jupiterApi.quoteGet(testParams);
+    if ('error' in quote) {
+      botState.jupiterOnline = false;
+      botState.lastJupiterError = `Quote error: ${JSON.stringify(quote)}`;
+      return false;
+    }
+    botState.jupiterOnline = true;
+    botState.lastJupiterError = "";
+    return true;
+  } catch (error: any) {
+    botState.jupiterOnline = false;
+    botState.lastJupiterError = error?.message || String(error);
+    return false;
+  }
+}
+
+async function getQuote(amountLamports: number): Promise<any | null> {
   try {
     const params: QuoteGetRequest = {
       inputMint: INPUT_MINT,
@@ -138,48 +165,88 @@ async function getQuote(amountLamports: number): Promise<any | null> {  // Use '
       amount: amountLamports,
       slippageBps: SLIPPAGE_BPS,
     };
+    console.log(`📡 Requesting quote for ${amountLamports} lamports...`);
     const quote = await jupiterApi.quoteGet(params);
     if ('error' in quote) {
-      console.error("Quote error:", quote);
+      const errMsg = JSON.stringify(quote);
+      console.error("❌ Quote error:", errMsg);
+      botState.lastJupiterError = errMsg;
+      botState.jupiterOnline = false;
       return null;
     }
+    botState.jupiterOnline = true;
+    console.log(`✅ Quote received: ${quote.outAmount} output amount`);
     return quote;
-  } catch (error) {
-    console.error("Failed to get quote:", error);
+  } catch (error: any) {
+    const errMsg = error?.message || String(error);
+    console.error("❌ Failed to get quote:", errMsg);
+    botState.lastJupiterError = errMsg;
+    botState.jupiterOnline = false;
     return null;
   }
 }
 
-async function executeSwap(quote: any): Promise<{ success: boolean; txSig?: string }> {
+async function executeSwap(quote: any): Promise<{ success: boolean; txSig?: string; error?: string }> {
   try {
+    console.log(`🔄 Preparing swap transaction...`);
     const params: SwapPostRequest = {
       swapRequest: {
         quoteResponse: quote,
         userPublicKey: walletKeypair.publicKey.toBase58(),
         wrapAndUnwrapSol: true,
         dynamicComputeUnitLimit: true,
-        prioritizationFeeLamports: 'auto',
       },
     };
-    const { swapTransaction } = await jupiterApi.swapPost(params);
     
+    console.log(`📡 Requesting swap from Jupiter...`);
+    const swapResponse = await jupiterApi.swapPost(params);
+    const { swapTransaction } = swapResponse;
+    
+    if (!swapTransaction) {
+      const errMsg = `No swap transaction returned: ${JSON.stringify(swapResponse)}`;
+      console.error(`❌ ${errMsg}`);
+      botState.lastJupiterError = errMsg;
+      return { success: false, error: errMsg };
+    }
+    
+    console.log(`✅ Swap transaction received, signing...`);
     const transactionBuffer = Buffer.from(swapTransaction, "base64");
     const transaction = VersionedTransaction.deserialize(transactionBuffer);
     transaction.sign([walletKeypair]);
+    
+    console.log(`📤 Broadcasting transaction to Solana...`);
     const txSig = await connection.sendRawTransaction(transaction.serialize(), {
       skipPreflight: false,
       maxRetries: 3,
     });
+    console.log(`⏳ Confirming transaction: ${txSig}`);
+    
     const latestBlockhash = await connection.getLatestBlockhash();
     await connection.confirmTransaction({
       signature: txSig,
       blockhash: latestBlockhash.blockhash,
       lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
     });
+    
+    console.log(`✅ Transaction confirmed!`);
     return { success: true, txSig };
-  } catch (error) {
-    console.error("Swap error:", error);
-    return { success: false };
+  } catch (error: any) {
+    const errMsg = error?.message || String(error);
+    console.error("❌ Swap execution error:", errMsg);
+    
+    // Provide more specific error diagnosis
+    if (errMsg.includes("insufficient")) {
+      console.error("💡 Hint: Insufficient SOL balance for this trade");
+    } else if (errMsg.includes("0x1") || errMsg.includes("custom program error")) {
+      console.error("💡 Hint: Slippage tolerance exceeded or liquidity issue");
+    } else if (errMsg.includes("blockhash")) {
+      console.error("💡 Hint: Transaction expired, RPC may be slow");
+    } else if (errMsg.includes("429") || errMsg.includes("rate")) {
+      console.error("💡 Hint: Rate limited - consider adding delays between requests");
+    }
+    
+    botState.lastJupiterError = errMsg;
+    return { success: false, error: errMsg };
   }
 }
 
@@ -253,19 +320,28 @@ async function botStep(): Promise<void> {
         const outputUSDC = parseInt(quote.outAmount) / 1_000_000;
         const balanceSOL = await connection.getBalance(walletKeypair.publicKey) / LAMPORTS_PER_SOL;
         console.log(`[${timestamp}] 🟢 LIVE SWAP | ${tradeSize} SOL → ${outputUSDC.toFixed(2)} USDC`);
-        console.log(`[${timestamp}] 📝 TX: ${result.txSig}`);
+        console.log(`[${timestamp}] 📝 TX: https://solscan.io/tx/${result.txSig}`);
+        botState.trades++;
+        botState.wins++;
         await logToLovable(result.txSig, tradeSize, outputUSDC, balanceSOL, "success");
       } else {
-        // Fallback simulation
-        const change = (Math.random() * 5 - 2) / 100;
-        const newBalance = botState.balance * (1 + change);
-       
-        console.log(`[${timestamp}] 🟡 LIVE (SIM) ${(change * 100).toFixed(2)}% | Jupiter unavailable`);
-       
-        await logToLovable("sim", tradeSize, tradeSize * (1 + change), newBalance, change > 0 ? "success" : "failed");
+        // Log the actual error instead of just showing "Jupiter unavailable"
+        console.log(`[${timestamp}] 🔴 SWAP FAILED | Error: ${result.error || botState.lastJupiterError}`);
+        
+        // Only fallback to simulation if testMode is enabled
+        if (botState.testMode) {
+          const change = (Math.random() * 5 - 2) / 100;
+          const newBalance = botState.balance * (1 + change);
+          console.log(`[${timestamp}] 🟡 TEST MODE SIM ${(change * 100).toFixed(2)}%`);
+          await logToLovable("sim", tradeSize, tradeSize * (1 + change), newBalance, change > 0 ? "success" : "failed");
+        } else {
+          botState.trades++;
+          botState.losses++;
+          await logToLovable("failed", tradeSize, 0, botState.balance, "failed");
+        }
       }
     } else {
-      console.log(`[${timestamp}] ⚠️ Could not get quote`);
+      console.log(`[${timestamp}] ⚠️ Could not get quote | Last error: ${botState.lastJupiterError}`);
     }
   } else {
     console.log(`[${timestamp}] ⚪ Signal: ${botState.last_signal} | Regime: ${botState.regime} | Waiting...`);
@@ -283,7 +359,30 @@ async function mainLoop(): Promise<void> {
     console.error("❌ Failed to initialize. Check environment variables.");
     process.exit(1);
   }
-  console.log("🚀 Bot started - Waiting for dashboard commands...");
+  
+  // Check Jupiter API connectivity on startup
+  console.log("\n🔍 Checking Jupiter API connectivity...");
+  const jupiterHealthy = await checkJupiterHealth();
+  if (jupiterHealthy) {
+    console.log("✅ Jupiter API is ONLINE and responding");
+  } else {
+    console.error("⚠️ Jupiter API check failed:", botState.lastJupiterError);
+    console.error("⚠️ Bot will continue but trades may fail until Jupiter is reachable");
+  }
+  
+  // Check wallet balance
+  try {
+    const balanceLamports = await connection.getBalance(walletKeypair.publicKey);
+    const balanceSOL = balanceLamports / LAMPORTS_PER_SOL;
+    console.log(`💰 Wallet balance: ${balanceSOL.toFixed(4)} SOL`);
+    if (balanceSOL < 0.01) {
+      console.warn("⚠️ Warning: Very low SOL balance - trades may fail");
+    }
+  } catch (error) {
+    console.error("⚠️ Could not fetch wallet balance:", error);
+  }
+  
+  console.log("\n🚀 Bot started - Waiting for dashboard commands...");
   console.log("");
   // Main loop
   while (true) {

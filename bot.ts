@@ -19,6 +19,7 @@ const PRIVATE_KEY = process.env.SOLANA_PRIVATE_KEY || "";
 const LOVABLE_API_URL = process.env.LOVABLE_API_URL || "";
 const LOVABLE_CONTROL_URL = process.env.LOVABLE_CONTROL_URL || "";
 const JUPITER_API_KEY = process.env.JUPITER_API_KEY || ""; // Add this to your Railway variables (get free key from https://portal.jup.ag)
+const SUPABASE_API_KEY = process.env.SUPABASE_API_KEY || ""; // Supabase anon key for Lovable endpoints
 const INPUT_MINT = "So11111111111111111111111111111111111111112"; // SOL
 const OUTPUT_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"; // USDC
 const SLIPPAGE_BPS = 50;
@@ -106,9 +107,15 @@ function initialize(): boolean {
 // =========================
 async function getControlStatus(): Promise<ControlStatus | null> {
   try {
-    const response = await fetch(LOVABLE_CONTROL_URL);
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    if (SUPABASE_API_KEY) {
+      headers["apikey"] = SUPABASE_API_KEY;
+    }
+    const response = await fetch(LOVABLE_CONTROL_URL, { headers });
     if (!response.ok) {
-      console.error("Control endpoint error:", response.status);
+      console.error("Control endpoint error:", response.status, await response.text());
       return null;
     }
     return await response.json() as ControlStatus;
@@ -262,9 +269,15 @@ async function logToLovable(
 ): Promise<void> {
   if (!LOVABLE_API_URL) return;
   try {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    if (SUPABASE_API_KEY) {
+      headers["apikey"] = SUPABASE_API_KEY;
+    }
     await fetch(LOVABLE_API_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({
         txSig,
         inputAmount,

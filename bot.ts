@@ -32,11 +32,11 @@ const CONTROL_POLL_MS = 2000;
 // Use types from the library where possible, but keep custom for control
 interface ControlStatus {
   status: string;
-  trade_size_sol: number;
-  use_percentage_risk: boolean;
-  test_mode: boolean;
+  tradeSize: number;
+  usePercentageRisk: boolean;
+  testMode: boolean;
   balance: number;
-  initial_balance: number;
+  initialBalance: number;
 }
 
 // =========================
@@ -129,11 +129,11 @@ async function syncWithDashboard(): Promise<void> {
   const control = await getControlStatus();
   if (!control) return;
   botState.status = control.status as "RUNNING" | "STOPPED";
-  botState.tradeSizeSOL = control.trade_size_sol;
-  botState.usePercentageRisk = control.use_percentage_risk;
-  botState.testMode = control.test_mode;
+  botState.tradeSizeSOL = control.tradeSize;
+  botState.usePercentageRisk = control.usePercentageRisk;
+  botState.testMode = control.testMode;
   botState.balance = control.balance;
-  botState.initialBalance = control.initial_balance;
+  botState.initialBalance = control.initialBalance;
 }
 
 // =========================

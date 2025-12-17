@@ -17,18 +17,22 @@ const TEST_MODE = true; // toggle false for live
 const MAX_RISK_PCT = 0.03;
 const FIXED_SOL = 0.01;
 const PUMP_FUN_PROGRAM = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
-const TOP_FOMO_WALLETS = [
-  "FRANK_DEGODS_WALLET",
-  "WALLET2",
-  "WALLET3"
-]; // add top wallets
+const TOP_FOMO_LIMIT = 30;
 
 // ===================== STATE =====================
 const connection = new Connection(RPC_URL, "confirmed");
 const wallet = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
 const jupiter = createJupiterApiClient({ apiKey: JUPITER_API_KEY });
 
-interface OpenPosition { mint: PublicKey; sizeSOL: number; entryPriceSOL: number; peakPriceSOL: number; entryTs: number; type: "SNIPER" | "COPY"; source: string; }
+interface OpenPosition { 
+  mint: PublicKey; 
+  sizeSOL: number; 
+  entryPriceSOL: number; 
+  peakPriceSOL: number; 
+  entryTs: number; 
+  type: "SNIPER" | "COPY"; 
+  source: string; 
+}
 const openPositions: Map<string, OpenPosition> = new Map();
 
 // ===================== UTILS =====================
@@ -45,6 +49,21 @@ async function getQuoteTokenToSOL(mint: PublicKey, sizeSOL: number) { return { i
 async function executeSwap(_quote: any) { if (TEST_MODE) return "TEST_TX"; return "REAL_TX_SIG"; }
 async function fetchPriceSOL(_mint: PublicKey) { return 1; }
 async function isRugRiskHigh(_mint: PublicKey) { return false; }
+
+// ===================== FETCH TOP FOMO WALLETS =====================
+async function fetchTopFomoWallets(): Promise<string[]> {
+  try {
+    const res = await fetch(
+      "https://YOUR_SUPABASE_PROJECT_URL/rest/v1/fomo_leaderboard?select=wallet&order=score.desc&limit=30", 
+      { headers: { apikey: SUPABASE_API_KEY, Authorization: `Bearer ${SUPABASE_API_KEY}` } }
+    );
+    const data = await res.json();
+    return data.map((row: any) => row.wallet);
+  } catch (e) {
+    console.error("Failed to fetch top FOMO wallets:", e);
+    return [];
+  }
+}
 
 // ===================== PUMP FUN SNIPER =====================
 function initPumpFunSniper() {
@@ -112,10 +131,10 @@ async function monitorExits() {
 
 // ===================== AUTO COPY TOP FOMO =====================
 async function copyTopFomo() {
-  for (const fomoWallet of TOP_FOMO_WALLETS) {
+  const topWallets = await fetchTopFomoWallets();
+  for (const fomoWallet of topWallets) {
     try {
-      // fetch last mint from fomo wallet (stub)
-      const mint = new PublicKey("FAKE_MINT"); 
+      const mint = new PublicKey("FAKE_MINT"); // replace with actual logic per wallet
       const sizeSOL = FIXED_SOL > 0 ? FIXED_SOL : MAX_RISK_PCT;
       await tryTrade(mint, sizeSOL, "COPY", fomoWallet);
     } catch (e) {
@@ -128,7 +147,6 @@ async function copyTopFomo() {
 export async function runBot() {
   console.log("🚀 Bot started");
   initPumpFunSniper();
-
-  setInterval(monitorExits, 10000);      // monitor open positions
-  setInterval(copyTopFomo, 15000);       // copy FOMO wallets
+  setInterval(monitorExits, 10000);   // monitor open positions
+  setInterval(copyTopFomo, 15000);    // fetch & copy top FOMO wallets
 }

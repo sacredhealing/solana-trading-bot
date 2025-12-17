@@ -185,7 +185,12 @@ async function main() {
       await mirrorWalletTrades(control.copyWallet);
     }
 
-    for (const pair of control.pairs) {
+    const pairs = Array.isArray(control.pairs) ? control.pairs : [];
+    if (pairs.length === 0) {
+      console.log("⚠️ No trading pairs received from Lovable");
+      return;
+    }
+    for (const pair of pairs) {
       if (control.signal !== "WAIT") {
         await executeTrade(pair, control.signal);
       }

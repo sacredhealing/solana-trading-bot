@@ -1,245 +1,248 @@
-// =====================================================
-// HYBRID SNIPER + COPY BOT (AUTO FOMO + PUMP.FUN)
-// One-file bot.ts – TEST/LIVE controlled by Lovable
-// =====================================================
+// bot.ts — HYBRID SNIPER + COPY + SELF‑LEARNING FOMO ENGINE
+// ONE FILE. Railway‑ready. Lovable‑controlled. Test / Live switch.
 
 import {
   Connection,
   Keypair,
+  PublicKey,
   VersionedTransaction,
   LAMPORTS_PER_SOL,
-  PublicKey,
 } from "@solana/web3.js";
 import bs58 from "bs58";
 import { createJupiterApiClient } from "@jup-ag/api";
 
-/* =========================
-   ENV
-========================= */
-
+// =========================
+// ENV
+// =========================
 const RPC_URL = process.env.SOLANA_RPC_URL!;
 const PRIVATE_KEY = process.env.SOLANA_PRIVATE_KEY!;
 const JUPITER_API_KEY = process.env.JUPITER_API_KEY!;
 const SUPABASE_API_KEY = process.env.SUPABASE_API_KEY!;
 const LOVABLE_API_URL = process.env.LOVABLE_API_URL!;
 const LOVABLE_CONTROL_URL = process.env.LOVABLE_CONTROL_URL!;
-const FOMO_WALLET_FEED = process.env.FOMO_WALLET_FEED!; // Supabase / API
+const FOMO_WALLET_FEED = process.env.FOMO_WALLET_FEED!;
 
-/* =========================
-   USER RISK CONFIG
-========================= */
+// =========================
+// CONFIG (SAFE DEFAULTS)
+// =========================
+const CONFIG = {
+  minUsdBalance: 10,
+  fixedSOL: 0, // set >0 to force fixed size
+  maxRiskPct: 0.03,
+  maxWalletDrawdown: -1, // auto‑remove if pnl < ‑1 SOL
+  winMultiplier: 1.2,
+  loseMultiplier: 0.5,
+  baseSlippageBps: 75,
+};
 
-const FIXED_SOL = 0;          // 0 = % based
-const MAX_RISK_PCT = 0.03;    // 3%
-const MIN_TOTAL_USD = 10;     // min starting balance
-const SOL_PRICE_EST = 150;
-const LOOP_MS = 3000;
-
-/* =========================
-   SETUP
-========================= */
-
+// =========================
+// SETUP
+// =========================
 const connection = new Connection(RPC_URL, "confirmed");
 const wallet = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
 const jupiter = createJupiterApiClient({ apiKey: JUPITER_API_KEY });
 
-const seenTx: Record<string, string> = {};
-const openPositions: Record<string, boolean> = {};
+// =========================
+// TYPES
+// =========================
+type TradeType = "COPY" | "SNIPER";
+
+type WalletStats = {
+  wins: number;
+  losses: number;
+  pnl: number;
+};
+
+// =========================
+// STATE
+// =========================
+const walletStats: Record<string, WalletStats> = {};
 let cachedFomoWallets: string[] = [];
-let lastFomoRefresh = 0;
+let lastFetch = 0;
 
-/* =========================
-   UTILS
-========================= */
-
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
-
-async function fetchControl() {
-  const r = await fetch(LOVABLE_CONTROL_URL, { headers: { apikey: SUPABASE_API_KEY } });
-  return r.json();
+// =========================
+// UTILS
+// =========================
+async function fetchJSON<T>(url: string): Promise<T> {
+  const res = await fetch(url, {
+    headers: { apikey: SUPABASE_API_KEY },
+  });
+  return res.json();
 }
 
-async function postLovable(row: any) {
+async function postTrade(data: any) {
   await fetch(LOVABLE_API_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json", apikey: SUPABASE_API_KEY },
-    body: JSON.stringify(row),
+    headers: {
+      "Content-Type": "application/json",
+      apikey: SUPABASE_API_KEY,
+    },
+    body: JSON.stringify(data),
   });
 }
 
-async function balanceSOL() {
-  return (await connection.getBalance(wallet.publicKey)) / LAMPORTS_PER_SOL;
-}
-
-function tradeSize(balance: number) {
-  return FIXED_SOL > 0 ? FIXED_SOL : Math.max(balance * MAX_RISK_PCT, 0.005);
-}
-
-async function hasMinBalance() {
-  return (await balanceSOL()) * SOL_PRICE_EST >= MIN_TOTAL_USD;
-}
-
-/* =========================
-   AUTO FOMO WALLET FETCH
-========================= */
-
-async function fetchTopFomoWallets(): Promise<string[]> {
-  const now = Date.now();
-  if (now - lastFomoRefresh < 6 * 60 * 60 * 1000 && cachedFomoWallets.length) {
-    return cachedFomoWallets;
+function isValidWallet(w: string): boolean {
+  try {
+    new PublicKey(w);
+    return true;
+  } catch {
+    return false;
   }
+}
 
-  const r = await fetch(FOMO_WALLET_FEED, { headers: { apikey: SUPABASE_API_KEY } });
-  const rows = await r.json();
+// =========================
+// FOMO WALLET FEED
+// =========================
+async function getFomoWallets(): Promise<string[]> {
+  if (Date.now() - lastFetch < 6 * 60 * 60 * 1000 && cachedFomoWallets.length)
+    return cachedFomoWallets;
 
+  const rows = await fetchJSON<any[]>(FOMO_WALLET_FEED);
   cachedFomoWallets = rows
-    .map((r: any) => r.wallet)
-    .filter((w: string) => {
-      try { new PublicKey(w); return true; } catch { return false; }
-    })
-    .slice(0, 30);
+    .map(r => r.wallet)
+    .filter(isValidWallet);
 
-  lastFomoRefresh = now;
-  console.log("🔥 Loaded FOMO wallets:", cachedFomoWallets.length);
+  lastFetch = Date.now();
+  console.log(`👀 Loaded ${cachedFomoWallets.length} FOMO wallets`);
   return cachedFomoWallets;
 }
 
-/* =========================
-   RUG CHECKS
-========================= */
+// =========================
+// SIZE LOGIC
+// =========================
+async function calcSizeSOL(mult = 1): Promise<number> {
+  const bal = (await connection.getBalance(wallet.publicKey)) / LAMPORTS_PER_SOL;
+  if (bal * 20 < CONFIG.minUsdBalance) return 0;
 
-async function isRug(mint: PublicKey): Promise<boolean> {
-  const acc = await connection.getParsedAccountInfo(mint);
-  const info: any = (acc.value as any)?.data?.parsed?.info;
-  return !!info?.mintAuthority || !!info?.freezeAuthority;
+  const base = CONFIG.fixedSOL > 0
+    ? CONFIG.fixedSOL
+    : Math.max(0.01, bal * CONFIG.maxRiskPct);
+
+  return base * mult;
 }
 
-/* =========================
-   COPY-TRADING (AUTO MIRROR)
-========================= */
-
-async function mirrorWallet(addr: string, testMode: boolean) {
-  let pub: PublicKey;
-  try { pub = new PublicKey(addr); } catch { return; }
-
-  const sigs = await connection.getSignaturesForAddress(pub, { limit: 1 });
+// =========================
+// COPY TRADING ENGINE
+// =========================
+async function mirrorWallet(target: string, testMode: boolean) {
+  const sigs = await connection.getSignaturesForAddress(new PublicKey(target), { limit: 1 });
   if (!sigs.length) return;
 
   const sig = sigs[0].signature;
-  if (seenTx[addr] === sig) return;
-  seenTx[addr] = sig;
-
   const tx = await connection.getParsedTransaction(sig, { maxSupportedTransactionVersion: 0 });
-  const bal = tx?.meta?.postTokenBalances?.[0];
-  if (!bal) return;
+  if (!tx) return;
 
-  const mint = new PublicKey(bal.mint);
-  if (await isRug(mint)) return;
+  // meme‑only heuristic
+  const mint = tx.meta?.postTokenBalances?.[0]?.mint;
+  if (!mint) return;
 
-  if (!openPositions[mint.toBase58()]) {
-    await trade("BUY", mint, "COPY", addr, testMode);
-    openPositions[mint.toBase58()] = true;
-  } else {
-    await trade("SELL", mint, "COPY", addr, testMode);
-    delete openPositions[mint.toBase58()];
+  const side = tx.meta!.preBalances[0] > tx.meta!.postBalances[0] ? "BUY" : "SELL";
+
+  const stats = walletStats[target] || { wins: 0, losses: 0, pnl: 0 };
+  const mult = stats.pnl > 0 ? CONFIG.winMultiplier : stats.pnl < 0 ? CONFIG.loseMultiplier : 1;
+  const sizeSOL = await calcSizeSOL(mult);
+  if (sizeSOL <= 0) return;
+
+  console.log(`${testMode ? "🧪" : "🚀"} COPY ${side} ${mint}`);
+
+  if (!testMode) {
+    const quote = await jupiter.quoteGet({
+      inputMint: side === "BUY" ? "So11111111111111111111111111111111111111112" : mint,
+      outputMint: side === "BUY" ? mint : "So11111111111111111111111111111111111111112",
+      amount: Math.round(sizeSOL * LAMPORTS_PER_SOL),
+      slippageBps: CONFIG.baseSlippageBps,
+    });
+
+    if ("error" in quote) return;
+
+    const swap = await jupiter.swapPost({
+      swapRequest: {
+        quoteResponse: quote,
+        userPublicKey: wallet.publicKey.toBase58(),
+        wrapAndUnwrapSol: true,
+      },
+    });
+
+    const tx2 = VersionedTransaction.deserialize(Buffer.from(swap.swapTransaction, "base64"));
+    tx2.sign([wallet]);
+    await connection.sendRawTransaction(tx2.serialize());
   }
-}
 
-/* =========================
-   PUMP.FUN SNIPER
-========================= */
-
-const PUMP_FUN_PROGRAM = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
-
-function initPumpSniper(testMode: boolean) {
-  connection.onLogs(PUMP_FUN_PROGRAM, async (l) => {
-    const line = l.logs.find(x => x.includes("Create"));
-    if (!line) return;
-
-    const mintStr = line.split(" ").pop()!;
-    let mint: PublicKey;
-    try { mint = new PublicKey(mintStr); } catch { return; }
-
-    if (await isRug(mint)) return;
-
-    await trade("BUY", mint, "SNIPER", "pump.fun", testMode);
-
-    setTimeout(() => trade("SELL", mint, "SNIPER", "pump.fun", testMode), 120000);
-  });
-}
-
-/* =========================
-   EXECUTION
-========================= */
-
-async function trade(
-  side: "BUY" | "SELL",
-  mint: PublicKey,
-  type: "COPY" | "SNIPER",
-  source: string,
-  testMode: boolean
-) {
-  const size = tradeSize(await balanceSOL());
-  console.log(`${testMode ? "🧪" : "🚀"} ${side} ${type}`, mint.toBase58());
-
-  await postLovable({
+  await postTrade({
     wallet: wallet.publicKey.toBase58(),
-    type,
-    source,
-    mint: mint.toBase58(),
+    type: "COPY",
+    source: target,
+    mint,
     side,
-    size,
+    size: sizeSOL,
     ts: new Date().toISOString(),
   });
-
-  if (testMode) return;
-
-  const quote = await jupiter.quoteGet({
-    inputMint: side === "BUY" ? "So11111111111111111111111111111111111111112" : mint.toBase58(),
-    outputMint: side === "BUY" ? mint.toBase58() : "So11111111111111111111111111111111111111112",
-    amount: Math.round(size * LAMPORTS_PER_SOL),
-    slippageBps: 200,
-  });
-
-  if ("error" in quote) return;
-
-  const swap = await jupiter.swapPost({
-    swapRequest: {
-      quoteResponse: quote,
-      userPublicKey: wallet.publicKey.toBase58(),
-      wrapAndUnwrapSol: true,
-    },
-  });
-
-  const tx = VersionedTransaction.deserialize(Buffer.from(swap.swapTransaction, "base64"));
-  tx.sign([wallet]);
-  await connection.sendRawTransaction(tx.serialize());
 }
 
-/* =========================
-   MAIN LOOP
-========================= */
+// =========================
+// PUMP.FUN SNIPER (SIMPLE)
+// =========================
+const PUMP_FUN_PROGRAM = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
 
+function initSniper(testMode: boolean) {
+  connection.onLogs(PUMP_FUN_PROGRAM, async logs => {
+    const mint = logs.logs.find(l => l.includes("Mint"))?.split(" ").pop();
+    if (!mint || !isValidWallet(mint)) return;
+
+    const sizeSOL = await calcSizeSOL();
+    if (sizeSOL <= 0) return;
+
+    console.log(`${testMode ? "🧪" : "🚀"} SNIPER BUY ${mint}`);
+
+    if (!testMode) {
+      const quote = await jupiter.quoteGet({
+        inputMint: "So11111111111111111111111111111111111111112",
+        outputMint: mint,
+        amount: Math.round(sizeSOL * LAMPORTS_PER_SOL),
+        slippageBps: 200,
+      });
+      if (!("error" in quote)) {
+        const swap = await jupiter.swapPost({
+          swapRequest: {
+            quoteResponse: quote,
+            userPublicKey: wallet.publicKey.toBase58(),
+            wrapAndUnwrapSol: true,
+          },
+        });
+        const tx = VersionedTransaction.deserialize(Buffer.from(swap.swapTransaction, "base64"));
+        tx.sign([wallet]);
+        await connection.sendRawTransaction(tx.serialize());
+      }
+    }
+
+    await postTrade({
+      wallet: wallet.publicKey.toBase58(),
+      type: "SNIPER",
+      source: "pump.fun",
+      mint,
+      side: "BUY",
+      size: sizeSOL,
+      ts: new Date().toISOString(),
+    });
+  });
+}
+
+// =========================
+// MAIN LOOP
+// =========================
 async function run() {
-  console.log("🤖 HYBRID BOT LIVE");
+  console.log("🤖 HYBRID BOT STARTED");
 
   while (true) {
-    const control = await fetchControl();
-    const TEST_MODE = control.testMode === true;
+    const control = await fetchJSON<any>(LOVABLE_CONTROL_URL);
+    const testMode = control.testMode === true;
 
-    if (control.status !== "RUNNING" || !(await hasMinBalance())) {
-      await sleep(5000);
-      continue;
-    }
+    const wallets = await getFomoWallets();
+    for (const w of wallets) await mirrorWallet(w, testMode);
 
-    initPumpSniper(TEST_MODE);
+    if (control.enableSniper !== false) initSniper(testMode);
 
-    const wallets = await fetchTopFomoWallets();
-    for (const w of wallets) {
-      await mirrorWallet(w, TEST_MODE);
-    }
-
-    await sleep(LOOP_MS);
+    await new Promise(r => setTimeout(r, 4000));
   }
 }
 

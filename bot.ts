@@ -1,11 +1,9 @@
 // =========================
-// bot.ts — Lovable Automated Trading Bot (LIVE + LOGGING)
-// =========================
-// This version:
-// ✅ Trades automatically via dashboard signals
-// ✅ Logs every action to Lovable
-// ✅ Consumes signals (no repeat trades)
-// ✅ Position-aware (SOL / USDC)
+// Advanced Solana Trading Bot
+// - PnL Tracking
+// - Multi-Pair Trading
+// - Copy Trading
+// - Lovable UI Controlled
 // =========================
 
 import {
@@ -16,232 +14,184 @@ import {
   PublicKey,
 } from "@solana/web3.js";
 import bs58 from "bs58";
-import fetch from "node-fetch";
 import { createJupiterApiClient } from "@jup-ag/api";
 
 // =========================
-// CONFIG
+// ENV CONFIG
 // =========================
 const RPC_URL = process.env.SOLANA_RPC_URL!;
 const PRIVATE_KEY = process.env.SOLANA_PRIVATE_KEY!;
-const LOVABLE_API_URL = process.env.LOVABLE_API_URL!; // activity log endpoint
-const LOVABLE_CONTROL_URL = process.env.LOVABLE_CONTROL_URL!; // dashboard control
-const SUPABASE_API_KEY = process.env.SUPABASE_API_KEY!;
 const JUPITER_API_KEY = process.env.JUPITER_API_KEY!;
-
-const SOL_MINT = "So11111111111111111111111111111111111111112";
-const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-
-const SLIPPAGE_BPS = 50;
-const LOOP_MS = 3000;
+const LOVABLE_CONTROL_URL = process.env.LOVABLE_CONTROL_URL!;
+const LOVABLE_API_URL = process.env.LOVABLE_API_URL!;
+const SUPABASE_API_KEY = process.env.SUPABASE_API_KEY!;
 
 // =========================
 // TYPES
 // =========================
-interface ControlStatus {
+
+type TradeSignal = "BUY" | "SELL" | "WAIT";
+
+type PairConfig = {
+  symbol: string;              // e.g. SOL/USDC
+  inputMint: string;
+  outputMint: string;
+  tradeSize: number;           // in base token (SOL or USDC)
+};
+
+interface ControlPayload {
   status: "RUNNING" | "STOPPED";
-  lastSignal: "BUY" | "SELL" | "WAIT";
-  tradeSize: number; // SOL
+  signal: TradeSignal;
   testMode: boolean;
+  pairs: PairConfig[];
+  copyWallet?: string;         // optional wallet to mirror
+}
+
+interface PositionState {
+  entryPrice: number;
+  entryAmount: number;
 }
 
 // =========================
 // STATE
 // =========================
-let state = {
-  status: "STOPPED" as ControlStatus["status"],
-  lastSignal: "WAIT" as ControlStatus["lastSignal"],
-  tradeSize: 0.1,
-  testMode: false,
-  position: "SOL" as "SOL" | "USDC",
+
+const connection = new Connection(RPC_URL, "confirmed");
+const wallet = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
+const jupiter = createJupiterApiClient({ apiKey: JUPITER_API_KEY });
+
+const positions: Record<string, PositionState | null> = {};
+
+let stats = {
+  trades: 0,
+  wins: 0,
+  losses: 0,
+  pnl: 0,
 };
 
-let connection: Connection;
-let wallet: Keypair;
-let jupiter = createJupiterApiClient({ apiKey: JUPITER_API_KEY });
+// =========================
+// UTILS
+// =========================
 
-// =========================
-// INIT
-// =========================
-function init() {
-  connection = new Connection(RPC_URL, "confirmed");
-  wallet = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
-  console.log("✅ Bot wallet:", wallet.publicKey.toBase58());
+async function fetchJSON<T>(url: string): Promise<T> {
+  const res = await fetch(url, {
+    headers: { apikey: SUPABASE_API_KEY },
+  });
+  return res.json();
 }
 
-// =========================
-// DASHBOARD
-// =========================
-async function fetchControl(): Promise<ControlStatus | null> {
-  try {
-    const res = await fetch(LOVABLE_CONTROL_URL, {
-      headers: {
-        "Content-Type": "application/json",
-        apikey: SUPABASE_API_KEY,
-      },
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as ControlStatus;
-  } catch {
-    return null;
-  }
-}
-
-function consumeSignal() {
-  state.lastSignal = "WAIT";
-}
-
-// =========================
-// LOGGING (THIS IS WHAT LOVABLE NEEDS)
-// =========================
-async function logActivity(payload: {
-  txSig: string;
-  action: "BUY" | "SELL" | "SIM";
-  inputAmount: number;
-  outputAmount: number;
-  balanceSOL: number;
-  status: "success" | "failed";
-}) {
-  await fetch(LOVABLE_API_URL, {
+async function postJSON(url: string, body: any) {
+  await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       apikey: SUPABASE_API_KEY,
     },
-    body: JSON.stringify({
-      ...payload,
-      wallet: wallet.publicKey.toBase58(),
-      timestamp: new Date().toISOString(),
-    }),
+    body: JSON.stringify(body),
   });
 }
 
 // =========================
-// JUPITER
+// COPY TRADING
 // =========================
-async function swap(quote: any): Promise<string> {
-  const { swapTransaction } = await jupiter.swapPost({
+
+async function mirrorWalletTrades(walletAddress: string) {
+  const sigs = await connection.getSignaturesForAddress(
+    new PublicKey(walletAddress),
+    { limit: 1 }
+  );
+  return sigs.length ? sigs[0].signature : null;
+}
+
+// =========================
+// TRADING CORE
+// =========================
+
+async function executeTrade(pair: PairConfig, side: TradeSignal) {
+  const amount = Math.round(pair.tradeSize * LAMPORTS_PER_SOL);
+
+  const quote = await jupiter.quoteGet({
+    inputMint: side === "BUY" ? pair.inputMint : pair.outputMint,
+    outputMint: side === "BUY" ? pair.outputMint : pair.inputMint,
+    amount,
+    slippageBps: 50,
+  });
+
+  if ("error" in quote) return;
+
+  const swap = await jupiter.swapPost({
     swapRequest: {
       quoteResponse: quote,
       userPublicKey: wallet.publicKey.toBase58(),
       wrapAndUnwrapSol: true,
-      dynamicComputeUnitLimit: true,
     },
   });
 
   const tx = VersionedTransaction.deserialize(
-    Buffer.from(swapTransaction, "base64")
+    Buffer.from(swap.swapTransaction, "base64")
   );
   tx.sign([wallet]);
+
   const sig = await connection.sendRawTransaction(tx.serialize());
-  await connection.confirmTransaction(sig, "confirmed");
-  return sig;
-}
 
-// =========================
-// BOT STEP
-// =========================
-async function step() {
-  const control = await fetchControl();
-  if (!control) return;
+  const price = Number(quote.outAmount) / Number(quote.inAmount);
 
-  state.status = control.status;
-  state.lastSignal = control.lastSignal;
-  state.tradeSize = control.tradeSize;
-  state.testMode = control.testMode;
+  if (side === "BUY") {
+    positions[pair.symbol] = {
+      entryPrice: price,
+      entryAmount: pair.tradeSize,
+    };
+  } else if (side === "SELL" && positions[pair.symbol]) {
+    const entry = positions[pair.symbol]!;
+    const pnl = (price - entry.entryPrice) * entry.entryAmount;
 
-  if (state.status !== "RUNNING") return;
+    stats.pnl += pnl;
+    stats.trades++;
+    pnl > 0 ? stats.wins++ : stats.losses++;
 
-  // BUY
-  if (state.lastSignal === "BUY" && state.position === "SOL") {
-    const lamports = Math.round(state.tradeSize * LAMPORTS_PER_SOL);
+    positions[pair.symbol] = null;
 
-    if (state.testMode) {
-      await logActivity({
-        txSig: "sim",
-        action: "SIM",
-        inputAmount: state.tradeSize,
-        outputAmount: state.tradeSize * 1.01,
-        balanceSOL: state.tradeSize,
-        status: "success",
-      });
-      consumeSignal();
-      return;
-    }
-
-    const quote = await jupiter.quoteGet({
-      inputMint: SOL_MINT,
-      outputMint: USDC_MINT,
-      amount: lamports,
-      slippageBps: SLIPPAGE_BPS,
-    });
-
-    const sig = await swap(quote);
-    state.position = "USDC";
-
-    const outUSDC = parseInt(quote.outAmount) / 1_000_000;
-    const bal = (await connection.getBalance(wallet.publicKey)) / LAMPORTS_PER_SOL;
-
-    await logActivity({
+    await postJSON(LOVABLE_API_URL, {
+      wallet: wallet.publicKey.toBase58(),
+      pair: pair.symbol,
+      action: side,
+      entryPrice: entry.entryPrice,
+      exitPrice: price,
+      pnl,
+      roi: pnl / (entry.entryPrice * entry.entryAmount),
+      winRate: stats.wins / stats.trades,
+      totalPnL: stats.pnl,
       txSig: sig,
-      action: "BUY",
-      inputAmount: state.tradeSize,
-      outputAmount: outUSDC,
-      balanceSOL: bal,
-      status: "success",
+      timestamp: new Date().toISOString(),
     });
-
-    consumeSignal();
-  }
-
-  // SELL
-  if (state.lastSignal === "SELL" && state.position === "USDC") {
-    const accounts = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, {
-      mint: new PublicKey(USDC_MINT),
-    });
-    if (!accounts.value.length) return;
-
-    const usdc = parseInt(accounts.value[0].account.data.parsed.info.tokenAmount.amount);
-
-    const quote = await jupiter.quoteGet({
-      inputMint: USDC_MINT,
-      outputMint: SOL_MINT,
-      amount: usdc,
-      slippageBps: SLIPPAGE_BPS,
-    });
-
-    const sig = await swap(quote);
-    state.position = "SOL";
-
-    const outSOL = parseInt(quote.outAmount) / LAMPORTS_PER_SOL;
-    const bal = (await connection.getBalance(wallet.publicKey)) / LAMPORTS_PER_SOL;
-
-    await logActivity({
-      txSig: sig,
-      action: "SELL",
-      inputAmount: usdc / 1_000_000,
-      outputAmount: outSOL,
-      balanceSOL: bal,
-      status: "success",
-    });
-
-    consumeSignal();
   }
 }
 
 // =========================
 // MAIN LOOP
 // =========================
+
 async function main() {
-  init();
-  console.log("🚀 Automated trading bot started");
+  console.log("🤖 Advanced Trading Bot Started");
+
   while (true) {
-    try {
-      await step();
-    } catch (e) {
-      console.error("Bot error", e);
+    const control = await fetchJSON<ControlPayload>(LOVABLE_CONTROL_URL);
+    if (control.status !== "RUNNING") {
+      await new Promise(r => setTimeout(r, 3000));
+      continue;
     }
-    await new Promise(r => setTimeout(r, LOOP_MS));
+
+    if (control.copyWallet) {
+      await mirrorWalletTrades(control.copyWallet);
+    }
+
+    for (const pair of control.pairs) {
+      if (control.signal !== "WAIT") {
+        await executeTrade(pair, control.signal);
+      }
+    }
+
+    await new Promise(r => setTimeout(r, 3000));
   }
 }
 

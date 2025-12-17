@@ -4,9 +4,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "npx ts-node --esm bot.ts",
-    "dev": "npx ts-node --esm bot.ts",
-    "build": "tsc"
+    "scripts": {
+  "start": "node --loader ts-node/esm bot.ts",
+  "dev": "node --loader ts-node/esm bot.ts"
+}
+
   },
   "dependencies": {
     "@jup-ag/api": "^6.0.46",

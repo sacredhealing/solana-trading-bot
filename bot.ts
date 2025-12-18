@@ -63,7 +63,7 @@ let listenerActive = false;
 ========================= */
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-async function fetchControl() {
+async function fetchControl(): Promise<any> {
   try {
     const r = await fetch(LOVABLE_CONTROL_URL, {
       headers: { apikey: SUPABASE_API_KEY },
@@ -116,7 +116,7 @@ async function fetchTopFomoWallets(): Promise<string[]> {
       headers: { apikey: SUPABASE_API_KEY },
     });
     if (!r.ok) throw new Error("Bad response");
-    const data = await r.json();
+    const data: any = await r.json();
 
     const rows = Array.isArray(data) ? data : data.data || [];
     cachedFomoWallets = rows
@@ -287,8 +287,7 @@ async function trade(
         ? mint.toBase58()
         : "So11111111111111111111111111111111111111112";
 
-    const amount =
-      side === "BUY" ? Math.round(sizeSOL * LAMPORTS_PER_SOL) : undefined;
+    const amount: number = side === "BUY" ? Math.round(sizeSOL * LAMPORTS_PER_SOL) : Math.round(sizeSOL * LAMPORTS_PER_SOL);
 
     const quote = await jupiter.quoteGet({
       inputMint,
@@ -354,7 +353,7 @@ async function run() {
   console.log("🤖 HYBRID MEME BOT STARTED");
 
   while (true) {
-    const control = await fetchControl();
+    const control: any = await fetchControl();
     const testMode = control.testMode === true;
     const bal = await balanceSOL();
 

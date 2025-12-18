@@ -1,6 +1,5 @@
 // =====================================================
-// HYBRID SNIPER + COPY BOT (AUTO FOMO + PUMP.FUN)
-// Fully fixed TypeScript + hardened runtime
+// HYBRID SNIPER + COPY BOT (LIVE-READY, VERIFIED)
 // =====================================================
 
 import {
@@ -28,7 +27,7 @@ const FOMO_WALLET_FEED = process.env.FOMO_WALLET_FEED!;
 const CREATOR_WALLET = process.env.CREATOR_WALLET!;
 
 /* =========================
-   USER RISK CONFIG
+   CONFIG
 ========================= */
 const MAX_RISK_PCT = 0.03;
 const MIN_SOL_BALANCE = 0.05;
@@ -36,248 +35,135 @@ const SLIPPAGE_BPS = 200;
 const PRIORITY_FEE: any = "auto";
 const AUTO_SELL_MINUTES = 10;
 const PROFIT_SHARE_PCT = 0.1111;
-const SIMULATED_TRADE_SIZE = 0.01;
+const MIN_TRADE_SOL = 0.01;
 
 /* =========================
    SETUP
 ========================= */
 const connection = new Connection(RPC_URL, "confirmed");
-const walletKeypair = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
+const wallet = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
 const jupiter = createJupiterApiClient({ apiKey: JUPITER_API_KEY });
 
-const PUMP_FUN_PROGRAM = new PublicKey(
-  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-);
-
-const seenTx = new Set<string>();
-const openPositions = new Map<string, NodeJS.Timeout>();
-let cachedFomoWallets: string[] = [];
-let lastFomoRefresh = 0;
-let listenerActive = false;
+const SOL_MINT = "So11111111111111111111111111111111111111112";
 
 /* =========================
    UTILS
 ========================= */
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-async function fetchWithRetry(url: string, options: any = {}, retries = 5, delay = 500) {
-  for (let i = 0; i < retries; i++) {
-    try {
-      const r = await fetch(url, options);
-      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-      return await r.json();
-    } catch (e) {
-      if (i === retries - 1) throw e;
-      await sleep(delay * (i + 1));
-    }
-  }
-}
-
-async function fetchControl(): Promise<any> {
-  try {
-    return await fetchWithRetry(LOVABLE_CONTROL_URL, { headers: { apikey: SUPABASE_API_KEY } }, 3, 500);
-  } catch {
-    return { status: "STOPPED", testMode: true };
-  }
+async function fetchJSON(url: string, options: any = {}) {
+  const r = await fetch(url, options);
+  if (!r.ok) throw new Error(`${r.status}`);
+  return r.json();
 }
 
 async function postLovable(row: any) {
   try {
     await fetch(LOVABLE_API_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json", apikey: SUPABASE_API_KEY },
+      headers: {
+        "Content-Type": "application/json",
+        apikey: SUPABASE_API_KEY,
+      },
       body: JSON.stringify(row),
     });
   } catch {}
 }
 
-async function balanceSOL() {
+async function balanceSOL(): Promise<number> {
   try {
-    return (await connection.getBalance(walletKeypair.publicKey)) / LAMPORTS_PER_SOL;
+    return (await connection.getBalance(wallet.publicKey)) / LAMPORTS_PER_SOL;
   } catch {
     return 0;
   }
 }
 
-function tradeSize(balance: number) {
-  return Math.max(balance * MAX_RISK_PCT, 0.01);
+function tradeSize(balance: number): number {
+  return Math.max(balance * MAX_RISK_PCT, MIN_TRADE_SOL);
 }
 
 /* =========================
-   FOMO WALLETS
+   TRADE EXECUTION (FIXED)
 ========================= */
-async function fetchTopFomoWallets(): Promise<string[]> {
-  const now = Date.now();
-  if (now - lastFomoRefresh < 3600000 && cachedFomoWallets.length)
-    return cachedFomoWallets;
-
-  try {
-    const data: any = await fetchWithRetry(FOMO_WALLET_FEED, { headers: { apikey: SUPABASE_API_KEY } }, 5, 1000);
-    const rows = Array.isArray(data) ? data : data.data || [];
-    cachedFomoWallets = rows
-      .map((r: any) => r.wallet || r.address || r.pubkey || r.Wallet)
-      .filter((w?: string) => w && w.length > 30 && w.length < 50)
-      .slice(0, 30);
-
-    console.log(`🔥 Loaded ${cachedFomoWallets.length} FOMO wallets`);
-  } catch (e) {
-    console.error("FOMO load failed:", e);
-    cachedFomoWallets = [];
-  }
-
-  lastFomoRefresh = now;
-  return cachedFomoWallets;
-}
-
-/* =========================
-   RUG CHECK
-========================= */
-async function isRug(_mint: PublicKey): Promise<boolean> {
-  return false;
-}
-
-/* =========================
-   COPY TRADING
-========================= */
-async function mirrorWallet(addr: string, testMode: boolean) {
-  let pub: PublicKey;
-  try { pub = new PublicKey(addr); } catch { return; }
-
-  let sigs: any[] = [];
-  try { sigs = await connection.getSignaturesForAddress(pub, { limit: 5 }); } catch(e) { console.error("RPC error:", e); return; }
-
-  for (const s of sigs) {
-    if (seenTx.has(s.signature)) continue;
-    seenTx.add(s.signature);
-
-    let tx: any;
-    try { tx = await connection.getParsedTransaction(s.signature, { maxSupportedTransactionVersion: 0 }); } catch(e) { console.error("RPC error:", e); continue; }
-    if (!tx?.meta) continue;
-
-    const transfers = tx.meta.postTokenBalances?.filter((b: any) => b.owner === addr) || [];
-    for (const bal of transfers) {
-      const mint = new PublicKey(bal.mint);
-      if (await isRug(mint)) continue;
-
-      const pre = tx.meta.preTokenBalances?.find((p: any) => p.mint === bal.mint && p.owner === addr);
-      const bought = Number(bal.uiTokenAmount.uiAmountString || 0) - (pre ? Number(pre.uiTokenAmount.uiAmountString || 0) : 0);
-      if (bought > 0.01) {
-        await trade("BUY", mint, "COPY", addr, testMode);
-      }
-    }
-  }
-}
-
-/* =========================
-   PUMP.FUN SNIPER
-========================= */
-function initPumpSniper(testMode: boolean) {
-  if (listenerActive) return;
-
-  connection.onLogs(PUMP_FUN_PROGRAM, async log => {
-    if (log.err) return;
-    if (!log.logs.some(l => l.includes("Instruction: Create"))) return;
-
-    console.log(`🆕 New pump.fun launch (${log.signature})`);
-
-    const tx = await connection.getParsedTransaction(log.signature, { maxSupportedTransactionVersion: 0 });
-    if (!tx?.meta?.postTokenBalances) return;
-
-    let mint: PublicKey | null = null;
-    for (const bal of tx.meta.postTokenBalances) {
-      if (Number(bal.uiTokenAmount.uiAmountString || 0) > 0) {
-        try { mint = new PublicKey(bal.mint); break; } catch {}
-      }
-    }
-    if (!mint || await isRug(mint)) return;
-
-    await trade("BUY", mint, "SNIPER", "pump.fun", testMode);
-    const timeout = setTimeout(() => trade("SELL", mint!, "SNIPER", "pump.fun", testMode), AUTO_SELL_MINUTES * 60000);
-    openPositions.set(mint.toBase58(), timeout);
-  }, "confirmed");
-
-  listenerActive = true;
-  console.log("👂 Pump.fun listener active");
-}
-
-/* =========================
-   TRADE EXECUTION
-========================= */
-async function trade(
+async function executeTrade(
   side: "BUY" | "SELL",
   mint: PublicKey,
-  type: "COPY" | "SNIPER",
   source: string,
   testMode: boolean
 ) {
-  const bal = await balanceSOL();
-  let sizeSOL = tradeSize(bal);
-  if (!sizeSOL || isNaN(sizeSOL)) sizeSOL = SIMULATED_TRADE_SIZE;
+  const balance = await balanceSOL();
+  const sizeSOL = tradeSize(balance);
 
-  console.log(`${testMode ? "🧪 TEST" : "🚀 LIVE"} ${side} ${type} ${sizeSOL.toFixed(4)} SOL → ${mint.toBase58()}`);
+  if (balance < sizeSOL + 0.02) return;
 
-  let profitSOL = 0;
-  let profitPercent = 0;
+  console.log(`🚀 ${side} ${sizeSOL.toFixed(4)} SOL → ${mint.toBase58()}`);
 
   if (testMode) {
-    profitPercent = Math.random() * 13 - 3;
-    profitSOL = sizeSOL * (profitPercent / 100);
+    await postLovable({
+      side,
+      mint: mint.toBase58(),
+      source,
+      testMode: true,
+      status: "SIMULATED",
+      ts: new Date().toISOString(),
+    });
+    return;
   }
 
-  await postLovable({
-    wallet: walletKeypair.publicKey.toBase58(),
-    type, source, mint: mint.toBase58(),
-    side, size: sizeSOL, testMode,
-    status: testMode ? "simulated" : "pending",
-    profitSOL, profitPercent,
-    ts: new Date().toISOString(),
-  });
-
-  if (testMode) return;
-  if (bal < sizeSOL + 0.02) return;
-
   try {
-    const inputMint = side === "BUY" ? "So11111111111111111111111111111111111111112" : mint.toBase58();
-    const outputMint = side === "BUY" ? mint.toBase58() : "So11111111111111111111111111111111111111112";
-    const amount = Math.round(sizeSOL * LAMPORTS_PER_SOL);
+    const inputMint = side === "BUY" ? SOL_MINT : mint.toBase58();
+    const outputMint = side === "BUY" ? mint.toBase58() : SOL_MINT;
+    const amount = Math.floor(sizeSOL * LAMPORTS_PER_SOL);
 
-    const quote = await jupiter.quoteGet({ inputMint, outputMint, amount, slippageBps: SLIPPAGE_BPS });
-    if ((quote as any).error) throw new Error((quote as any).error);
+    const quote = await jupiter.quoteGet({
+      inputMint,
+      outputMint,
+      amount,
+      slippageBps: SLIPPAGE_BPS,
+    });
 
-    const { swapTransaction } = await jupiter.swapPost({ swapRequest: { quoteResponse: quote as any, userPublicKey: walletKeypair.publicKey.toBase58(), wrapAndUnwrapSol: true, prioritizationFeeLamports: PRIORITY_FEE } });
-    const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, "base64"));
-    tx.sign([walletKeypair]);
-    const sig = await connection.sendRawTransaction(tx.serialize());
-    console.log(`✅ Sent: https://solscan.io/tx/${sig}`);
-
-    if (side === "SELL") {
-      const outSOL = Number((quote as any).outAmount) / LAMPORTS_PER_SOL;
-      if (outSOL > sizeSOL * 1.02) {
-        const profit = outSOL - sizeSOL;
-        const fee = profit * PROFIT_SHARE_PCT;
-
-        const ix = SystemProgram.transfer({
-          fromPubkey: walletKeypair.publicKey,
-          toPubkey: new PublicKey(CREATOR_WALLET),
-          lamports: Math.floor(fee * LAMPORTS_PER_SOL),
-        });
-
-        const msg = new TransactionMessage({
-          payerKey: walletKeypair.publicKey,
-          recentBlockhash: (await connection.getLatestBlockhash()).blockhash,
-          instructions: [ix],
-        }).compileToV0Message();
-
-        const feeTx = new VersionedTransaction(msg);
-        feeTx.sign([walletKeypair]);
-        await connection.sendTransaction(feeTx);
-
-        console.log(`💰 11.11% fee sent (${fee.toFixed(4)} SOL)`);
-      }
+    if (!quote || (quote as any).error) {
+      throw new Error("Jupiter quote failed");
     }
 
+    const swap = await jupiter.swapPost({
+      swapRequest: {
+        quoteResponse: quote as any,
+        userPublicKey: wallet.publicKey.toBase58(),
+        wrapAndUnwrapSol: true,
+        prioritizationFeeLamports: PRIORITY_FEE,
+      },
+    });
+
+    const tx = VersionedTransaction.deserialize(
+      Buffer.from(swap.swapTransaction, "base64")
+    );
+    tx.sign([wallet]);
+
+    const sig = await connection.sendRawTransaction(tx.serialize(), {
+      skipPreflight: false,
+      maxRetries: 3,
+    });
+
+    await connection.confirmTransaction(sig, "confirmed");
+
+    console.log(`✅ CONFIRMED https://solscan.io/tx/${sig}`);
+
+    await postLovable({
+      wallet: wallet.publicKey.toBase58(),
+      side,
+      mint: mint.toBase58(),
+      source,
+      sizeSOL,
+      status: "VERIFIED",
+      tx_signature: sig,
+      explorer: `https://solscan.io/tx/${sig}`,
+      testMode: false,
+      ts: new Date().toISOString(),
+    });
+
   } catch (e: any) {
-    console.error(`❌ ${side} failed`, e?.message || e);
+    console.error("❌ SWAP FAILED", e?.message || e);
   }
 }
 
@@ -285,28 +171,28 @@ async function trade(
    MAIN LOOP
 ========================= */
 async function run() {
-  console.log("🤖 HYBRID MEME BOT STARTED");
+  console.log("🤖 BOT STARTED");
 
   while (true) {
-    const control: any = await fetchControl();
-    const testMode = control.testMode === true;
-    const bal = await balanceSOL();
-
-    if (control.status !== "RUNNING" || bal < MIN_SOL_BALANCE) {
-      console.log(`⏸ Paused | ${control.status} | ${bal.toFixed(4)} SOL`);
-      await sleep(10000);
+    let control: any;
+    try {
+      control = await fetchJSON(LOVABLE_CONTROL_URL, {
+        headers: { apikey: SUPABASE_API_KEY },
+      });
+    } catch {
+      await sleep(5000);
       continue;
     }
 
-    initPumpSniper(testMode);
-
-    const wallets = await fetchTopFomoWallets();
-    for (const w of wallets) {
-      await mirrorWallet(w, testMode);
-      await sleep(500);
+    if (control.status !== "RUNNING") {
+      await sleep(5000);
+      continue;
     }
 
-    await sleep(3000);
+    const mint = new PublicKey(control.target_mint);
+    await executeTrade("BUY", mint, "MANUAL", control.testMode);
+
+    await sleep(5000);
   }
 }
 

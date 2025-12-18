@@ -1,7 +1,6 @@
 // =====================================================
 // HYBRID SNIPER + COPY BOT (AUTO FOMO + PUMP.FUN)
-// Final Stable Version – All Bugs Fixed
-// Low Balance Protection + Robust FOMO + Reliable Mint Detection
+// Final Version – Clean Test Mode Logging for Lovable
 // =====================================================
 import {
   Connection,
@@ -27,11 +26,12 @@ const FOMO_WALLET_FEED = process.env.FOMO_WALLET_FEED!;
 /* =========================
    USER RISK CONFIG
 ========================= */
-const MAX_RISK_PCT = 0.03; // 3% of balance per trade
-const MIN_SOL_BALANCE = 0.05; // Pause bot if below
+const MAX_RISK_PCT = 0.03;
+const MIN_SOL_BALANCE = 0.05;
 const SLIPPAGE_BPS = 200;
 const PRIORITY_FEE = "auto";
 const AUTO_SELL_MINUTES = 10;
+const SIMULATED_TRADE_SIZE = 0.01; // Fixed size for test mode logging when balance low
 
 /* =========================
    SETUP
@@ -70,7 +70,9 @@ async function postLovable(row: any) {
       headers: { "Content-Type": "application/json", apikey: SUPABASE_API_KEY },
       body: JSON.stringify(row),
     });
-  } catch {}
+  } catch (e) {
+    console.error("Failed to log to Lovable:", e);
+  }
 }
 
 async function balanceSOL() {
@@ -86,7 +88,7 @@ function tradeSize(balance: number) {
 }
 
 /* =========================
-   FOMO WALLETS – Robust
+   FOMO WALLETS
 ========================= */
 async function fetchTopFomoWallets(): Promise<string[]> {
   const now = Date.now();
@@ -113,10 +115,10 @@ async function fetchTopFomoWallets(): Promise<string[]> {
 }
 
 /* =========================
-   RUG CHECK (Placeholder – improve later)
+   RUG CHECK
 ========================= */
 async function isRug(mint: PublicKey): Promise<boolean> {
-  return false; // Allow all for now
+  return false;
 }
 
 /* =========================
@@ -149,7 +151,7 @@ async function mirrorWallet(addr: string, testMode: boolean) {
 }
 
 /* =========================
-   PUMP.FUN SNIPER – Reliable Mint Detection
+   PUMP.FUN SNIPER
 ========================= */
 function initPumpSniper(testMode: boolean) {
   if (listenerActive) return;
@@ -200,7 +202,7 @@ function initPumpSniper(testMode: boolean) {
 }
 
 /* =========================
-   EXECUTION – With Low Balance Protection
+   EXECUTION – Clean Test Logging
 ========================= */
 async function trade(
   side: "BUY" | "SELL",
@@ -210,7 +212,12 @@ async function trade(
   testMode: boolean
 ) {
   const currentBalance = await balanceSOL();
-  const sizeSOL = tradeSize(currentBalance);
+  let sizeSOL = tradeSize(currentBalance);
+
+  // Force realistic size for dashboard logging in test mode
+  if (testMode && (isNaN(sizeSOL) || sizeSOL <= 0 || !isFinite(sizeSOL))) {
+    sizeSOL = SIMULATED_TRADE_SIZE;
+  }
 
   console.log(`${testMode ? "🧪 TEST" : "🚀 LIVE"} ${side} ${type} | ${sizeSOL.toFixed(4)} SOL → ${mint.toBase58()}`);
 
@@ -222,14 +229,14 @@ async function trade(
     side,
     size: sizeSOL,
     testMode,
+    status: testMode ? "simulated" : "pending",
     ts: new Date().toISOString(),
   });
 
   if (testMode) return;
 
-  // Low balance protection
   if (currentBalance < (sizeSOL + 0.02)) {
-    console.log(`⚠️ Low balance (${currentBalance.toFixed(4)} SOL) – skipping ${side} trade`);
+    console.log(`⚠️ Low balance – skipping live trade`);
     return;
   }
 
@@ -270,7 +277,7 @@ async function trade(
    MAIN LOOP
 ========================= */
 async function run() {
-  console.log("🤖 FINAL STABLE HYBRID MEME BOT STARTED");
+  console.log("🤖 FINAL HYBRID MEME BOT – CLEAN TEST LOGGING");
 
   while (true) {
     const control = await fetchControl();

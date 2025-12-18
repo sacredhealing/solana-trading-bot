@@ -1,7 +1,6 @@
 // =====================================================
 // HYBRID SNIPER + COPY BOT (AUTO FOMO + PUMP.FUN)
-// Fixed Version – Removed Anchor/NodeWallet (No SDK Needed for Listener)
-// Uses direct logsSubscribe for reliable pump.fun create detection
+// Final Fixed Version – Robust FOMO + Better Mint Detection
 // =====================================================
 import {
   Connection,
@@ -27,7 +26,7 @@ const FOMO_WALLET_FEED = process.env.FOMO_WALLET_FEED!;
 /* =========================
    USER RISK CONFIG
 ========================= */
-const MAX_RISK_PCT = 0.03; // 3%
+const MAX_RISK_PCT = 0.03;
 const MIN_SOL_BALANCE = 0.05;
 const SLIPPAGE_BPS = 200;
 const PRIORITY_FEE = "auto";
@@ -82,7 +81,7 @@ function tradeSize(balance: number) {
 }
 
 /* =========================
-   FOMO WALLETS
+   FOMO WALLETS – Fixed
 ========================= */
 async function fetchTopFomoWallets(): Promise<string[]> {
   const now = Date.now();
@@ -90,31 +89,35 @@ async function fetchTopFomoWallets(): Promise<string[]> {
 
   try {
     const r = await fetch(FOMO_WALLET_FEED, { headers: { apikey: SUPABASE_API_KEY } });
-    const rows = await r.json();
+    if (!r.ok) throw new Error("Bad response");
+    const data = await r.json();
+
+    // Handle both direct array or {data: [...]}
+    const rows = Array.isArray(data) ? data : data.data || [];
+
     cachedFomoWallets = rows
-      .map((r: any) => r.wallet)
-      .filter((w: string) => {
-        try { new PublicKey(w); return true; } catch { return false; }
-      })
+      .map((r: any) => r.wallet || r.address || r.pubkey) // Flexible field names
+      .filter((w: string) => w && w.length > 30) // Rough pubkey check
       .slice(0, 30);
+
     console.log(`🔥 Loaded ${cachedFomoWallets.length} FOMO wallets`);
   } catch (e) {
     console.error("FOMO load failed:", e);
+    cachedFomoWallets = []; // Reset on error
   }
   lastFomoRefresh = now;
   return cachedFomoWallets;
 }
 
 /* =========================
-   RUG CHECK (Basic – improve later)
+   RUG CHECK (Basic placeholder)
 ========================= */
 async function isRug(mint: PublicKey): Promise<boolean> {
-  // Conservative: skip if we can't check
-  return false; // For now, allow most – add real checks later
+  return false; // Allow for now – add real checks later
 }
 
 /* =========================
-   COPY-TRADING
+   COPY-TRADING (Unchanged)
 ========================= */
 async function mirrorWallet(addr: string, testMode: boolean) {
   let pub: PublicKey;
@@ -143,7 +146,7 @@ async function mirrorWallet(addr: string, testMode: boolean) {
 }
 
 /* =========================
-   PUMP.FUN SNIPER (Direct logsSubscribe – Reliable)
+   PUMP.FUN SNIPER – Fixed Mint Extraction
 ========================= */
 function initPumpSniper(testMode: boolean) {
   if (listenerActive) return;
@@ -153,24 +156,30 @@ function initPumpSniper(testMode: boolean) {
     async (log) => {
       if (log.err) return;
 
-      // Look for "Program log: Instruction: Create" or similar in logs
-      const createLog = log.logs.find(l => l.includes("Instruction: Create") || l.includes("create"));
+      const createLog = log.logs.find(l => l.includes("Instruction: Create"));
       if (!createLog) return;
 
-      // Extract mint from signature or logs – rough but works for many cases
-      // Better: fetch tx and parse instructions (but for speed, this is ok starter)
-      console.log(`🆕 Potential new pump.fun token detected (sig: ${log.signature})`);
+      console.log(`🆕 New pump.fun launch detected (sig: ${log.signature})`);
 
-      // Fetch tx to get mint properly
       const tx = await connection.getParsedTransaction(log.signature, { maxSupportedTransactionVersion: 0 });
       if (!tx) return;
 
-      // Find mint from token balances or instructions (simplified)
-      const mintStr = tx.transaction.message.accountKeys.find(k => k.toBase58().length === 44 && !k.toBase58().startsWith("Sysvar"))?.toBase58();
-      if (!mintStr) return;
+      // Better mint extraction: look for new token account creation in postBalances
+      let mint: PublicKey | null = null;
+      if (tx.meta?.postTokenBalances) {
+        for (const bal of tx.meta.postTokenBalances) {
+          if (bal.uiTokenAmount.uiAmountString === "0") continue; // Skip empty
+          try {
+            mint = new PublicKey(bal.mint);
+            break;
+          } catch {}
+        }
+      }
 
-      let mint: PublicKey;
-      try { mint = new PublicKey(mintStr); } catch { return; }
+      if (!mint) {
+        console.log("Could not extract mint – skipping");
+        return;
+      }
 
       if (await isRug(mint)) {
         console.log("🚫 Rug risk – skipping");
@@ -190,7 +199,7 @@ function initPumpSniper(testMode: boolean) {
 }
 
 /* =========================
-   EXECUTION
+   EXECUTION (Unchanged)
 ========================= */
 async function trade(
   side: "BUY" | "SELL",
@@ -219,7 +228,7 @@ async function trade(
   try {
     const inputMint = side === "BUY" ? "So11111111111111111111111111111111111111112" : mint.toBase58();
     const outputMint = side === "BUY" ? mint.toBase58() : "So11111111111111111111111111111111111111112";
-    const amount = side === "BUY" ? Math.round(sizeSOL * LAMPORTS_PER_SOL) : undefined; // Jupiter handles sell amount
+    const amount = side === "BUY" ? Math.round(sizeSOL * LAMPORTS_PER_SOL) : undefined;
 
     const quote = await jupiter.quoteGet({
       inputMint,
@@ -253,14 +262,14 @@ async function trade(
    MAIN LOOP
 ========================= */
 async function run() {
-  console.log("🤖 HYBRID MEME BOT STARTED (No Anchor SDK)");
+  console.log("🤖 FINAL HYBRID MEME BOT STARTED");
 
   while (true) {
     const control = await fetchControl();
     const testMode = control.testMode === true;
 
     if (control.status !== "RUNNING" || (await balanceSOL()) < MIN_SOL_BALANCE) {
-      console.log("⏸ Paused");
+      console.log("⏸ Paused – check status or balance");
       await sleep(10000);
       continue;
     }

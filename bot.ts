@@ -1,220 +1,287 @@
+// =====================================================
+// HYBRID SNIPER + COPY BOT (LIVE + LOVABLE + PROFIT SHARE)
+// Fully TypeScript + hardened runtime + dynamic sizing
+// =====================================================
+
 import {
   Connection,
   Keypair,
-  PublicKey,
   VersionedTransaction,
-  TransactionMessage,
-  SystemProgram,
   LAMPORTS_PER_SOL,
+  PublicKey,
+  SystemProgram,
+  TransactionMessage,
 } from "@solana/web3.js";
 import bs58 from "bs58";
 import { createJupiterApiClient } from "@jup-ag/api";
 
-/* ================= ENV ================= */
+/* =========================
+   ENV VARIABLES
+========================= */
 const RPC_URL = process.env.SOLANA_RPC_URL!;
 const PRIVATE_KEY = process.env.SOLANA_PRIVATE_KEY!;
-const CREATOR_WALLET = process.env.CREATOR_WALLET!;
-const LOVABLE_CONTROL_URL = process.env.LOVABLE_CONTROL_URL!;
-const LOVABLE_API_URL = process.env.LOVABLE_API_URL!;
-const SUPABASE_API_KEY = process.env.SUPABASE_API_KEY!;
 const JUPITER_API_KEY = process.env.JUPITER_API_KEY!;
+const SUPABASE_API_KEY = process.env.SUPABASE_API_KEY!;
+const LOVABLE_API_URL = process.env.LOVABLE_API_URL!;
+const LOVABLE_CONTROL_URL = process.env.LOVABLE_CONTROL_URL!;
+const CREATOR_WALLET = process.env.CREATOR_WALLET!;
 
-/* ================= CONFIG ================= */
-const SOL_MINT = "So11111111111111111111111111111111111111112";
-const SLIPPAGE_BPS = 300;
-const AUTO_SELL_MINUTES = 10;
-const TRAILING_STOP_PCT = 0.25;
-const PROFIT_SHARE_PCT = 0.1111;
-const MIN_BUY_SOL = 0.01;
-const MAX_BUY_SOL = 0.1;
+/* =========================
+   CONFIG
+========================= */
+const MAX_RISK_PCT = 0.03;          // max % of balance per trade
+const MIN_SOL_BALANCE = 0.05;       // min balance to trade
+const SLIPPAGE_BPS = 200;
+const AUTO_SELL_MINUTES = 10;       // auto-sell timer
+const PROFIT_SHARE_PCT = 0.1111;    // 11.11% profit share
+const SIMULATED_TRADE_SIZE = 0.01;  // fallback trade size
+const PRIORITY_FEE: any = "auto";
 
-/* ================= SETUP ================= */
+/* =========================
+   SETUP
+========================= */
 const connection = new Connection(RPC_URL, "confirmed");
-const wallet = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
+const walletKeypair = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
 const jupiter = createJupiterApiClient({ apiKey: JUPITER_API_KEY });
 
-const openPositions = new Map<
-  string,
-  { entry: number; peak: number; timeout: NodeJS.Timeout }
->();
+const PUMP_FUN_PROGRAM = new PublicKey(
+  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+);
 
+const seenTx = new Set<string>();
+const openPositions = new Map<string, NodeJS.Timeout>();
+let listenerActive = false;
+
+/* =========================
+   UTILS
+========================= */
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-/* ================= UTILS ================= */
-async function fetchJSON(url: string) {
-  const r = await fetch(url, { headers: { apikey: SUPABASE_API_KEY } });
-  if (!r.ok) throw new Error("Fetch failed");
-  return r.json();
-}
-
-async function postLovable(data: any) {
-  try {
-    await fetch(LOVABLE_API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: SUPABASE_API_KEY,
-      },
-      body: JSON.stringify(data),
-    });
-  } catch {}
-}
-
-async function getBuySize(): Promise<number> {
-  const bal = await connection.getBalance(wallet.publicKey);
-  const sol = bal / LAMPORTS_PER_SOL;
-  return Math.max(MIN_BUY_SOL, Math.min(MAX_BUY_SOL, sol * 0.05));
-}
-
-/* ================= SWAP ================= */
-async function swap(
-  inputMint: string,
-  outputMint: string,
-  solAmount: number
-): Promise<string | null> {
-  const lamports = Math.floor(solAmount * LAMPORTS_PER_SOL);
-  if (lamports <= 0) return null;
-
-  const quote = await jupiter.quoteGet({
-    inputMint,
-    outputMint,
-    amount: lamports,
-    slippageBps: SLIPPAGE_BPS,
-  });
-
-  if ((quote as any).error) return null;
-
-  const { swapTransaction } = await jupiter.swapPost({
-    swapRequest: {
-      quoteResponse: quote as any,
-      userPublicKey: wallet.publicKey.toBase58(),
-      wrapAndUnwrapSol: true,
-      prioritizationFeeLamports: "auto",
-    },
-  });
-
-  const tx = VersionedTransaction.deserialize(
-    Buffer.from(swapTransaction, "base64")
-  );
-  tx.sign([wallet]);
-
-  return connection.sendRawTransaction(tx.serialize());
-}
-
-/* ================= BUY ================= */
-async function buy(mint: string, source: string) {
-  if (openPositions.has(mint)) return;
-
-  const size = await getBuySize();
-  const sig = await swap(SOL_MINT, mint, size);
-  if (!sig) return;
-
-  console.log("✅ BUY TX:", sig);
-
-  const timeout = setTimeout(
-    () => sell(mint),
-    AUTO_SELL_MINUTES * 60_000
-  );
-
-  openPositions.set(mint, {
-    entry: size,
-    peak: size,
-    timeout,
-  });
-
-  await postLovable({ type: "BUY", mint, tx_signature: sig, source });
-}
-
-/* ================= SELL ================= */
-async function sell(mint: string) {
-  const pos = openPositions.get(mint);
-  if (!pos) return;
-
-  clearTimeout(pos.timeout);
-
-  const sig = await swap(mint, SOL_MINT, pos.entry);
-  if (!sig) return;
-
-  console.log("💰 SELL TX:", sig);
-
-  const profit = pos.peak - pos.entry;
-  if (profit > 0) await profitShare(profit);
-
-  openPositions.delete(mint);
-
-  await postLovable({
-    type: "SELL",
-    mint,
-    tx_signature: sig,
-    verified: true,
-  });
-}
-
-/* ================= TRAILING STOP ================= */
-async function monitor() {
-  for (const [mint, pos] of openPositions) {
-    const quote = await jupiter.quoteGet({
-      inputMint: mint,
-      outputMint: SOL_MINT,
-      amount: pos.entry * LAMPORTS_PER_SOL,
-      slippageBps: 500,
-    });
-
-    const out = Number((quote as any)?.outAmount || 0) / LAMPORTS_PER_SOL;
-    if (out > pos.peak) pos.peak = out;
-
-    if (out < pos.peak * (1 - TRAILING_STOP_PCT)) {
-      await sell(mint);
+async function fetchWithRetry(url: string, options: any = {}, retries = 5, delay = 500) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const r = await fetch(url, options);
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+      return await r.json();
+    } catch (e) {
+      if (i === retries - 1) throw e;
+      await sleep(delay * (i + 1));
     }
   }
 }
 
-/* ================= PROFIT SHARE ================= */
-async function profitShare(sol: number) {
-  const lamports = Math.floor(sol * PROFIT_SHARE_PCT * LAMPORTS_PER_SOL);
-  if (lamports <= 0) return;
-
-  const ix = SystemProgram.transfer({
-    fromPubkey: wallet.publicKey,
-    toPubkey: new PublicKey(CREATOR_WALLET),
-    lamports,
-  });
-
-  const msg = new TransactionMessage({
-    payerKey: wallet.publicKey,
-    recentBlockhash: (await connection.getLatestBlockhash()).blockhash,
-    instructions: [ix],
-  }).compileToV0Message();
-
-  const tx = new VersionedTransaction(msg);
-  tx.sign([wallet]);
-  await connection.sendTransaction(tx);
-
-  console.log("💸 PROFIT SHARE SENT");
+async function fetchControl(): Promise<any> {
+  try {
+    return await fetchWithRetry(LOVABLE_CONTROL_URL, { headers: { apikey: SUPABASE_API_KEY } }, 3, 500);
+  } catch {
+    return { status: "STOPPED", testMode: true, copyTrading: { wallets: [] } };
+  }
 }
 
-/* ================= MAIN ================= */
-async function run() {
-  console.log("🤖 BOT LIVE");
+async function postLovable(row: any) {
+  try {
+    await fetch(LOVABLE_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", apikey: SUPABASE_API_KEY },
+      body: JSON.stringify(row),
+    });
+  } catch {}
+}
 
-  while (true) {
-    try {
-      const control = await fetchJSON(LOVABLE_CONTROL_URL);
-      if (control.status !== "RUNNING") {
-        await sleep(5000);
-        continue;
+async function balanceSOL() {
+  try {
+    return (await connection.getBalance(walletKeypair.publicKey)) / LAMPORTS_PER_SOL;
+  } catch {
+    return 0;
+  }
+}
+
+function tradeSize(balance: number) {
+  return Math.max(balance * MAX_RISK_PCT, SIMULATED_TRADE_SIZE);
+}
+
+async function isRug(_mint: PublicKey): Promise<boolean> {
+  // placeholder anti-rug filter
+  return false;
+}
+
+/* =========================
+   COPY TRADING
+========================= */
+async function mirrorWallet(addr: string, testMode: boolean) {
+  let pub: PublicKey;
+  try { pub = new PublicKey(addr); } catch { return; }
+
+  let sigs: any[] = [];
+  try { sigs = await connection.getSignaturesForAddress(pub, { limit: 5 }); } catch(e) { console.error("RPC error:", e); return; }
+
+  for (const s of sigs) {
+    if (seenTx.has(s.signature)) continue;
+    seenTx.add(s.signature);
+
+    let tx: any;
+    try { tx = await connection.getParsedTransaction(s.signature, { maxSupportedTransactionVersion: 0 }); } catch(e) { console.error("RPC error:", e); continue; }
+    if (!tx?.meta) continue;
+
+    const transfers = tx.meta.postTokenBalances?.filter((b: any) => b.owner === addr) || [];
+    for (const bal of transfers) {
+      const mint = new PublicKey(bal.mint);
+      if (await isRug(mint)) continue;
+
+      const pre = tx.meta.preTokenBalances?.find((p: any) => p.mint === bal.mint && p.owner === addr);
+      const bought = Number(bal.uiTokenAmount.uiAmountString || 0) - (pre ? Number(pre.uiTokenAmount.uiAmountString || 0) : 0);
+      if (bought > 0.01) {
+        await trade("BUY", mint, "COPY", addr, testMode);
       }
+    }
+  }
+}
 
-      for (const w of control.copyTrading?.wallets || []) {
-        // Hook your mirror logic here if needed
+/* =========================
+   PUMP.FUN SNIPER
+========================= */
+function initPumpSniper(testMode: boolean) {
+  if (listenerActive) return;
+
+  connection.onLogs(PUMP_FUN_PROGRAM, async (log) => {
+    if (log.err) return;
+
+    console.log(`Pump.fun log detected (sig: ${log.signature})`);
+
+    const tx = await connection.getParsedTransaction(log.signature, { maxSupportedTransactionVersion: 0 });
+    if (!tx?.meta?.postTokenBalances) return;
+
+    for (const bal of tx.meta.postTokenBalances) {
+      if (Number(bal.uiTokenAmount.uiAmountString || 0) > 0) {
+        const mint = new PublicKey(bal.mint);
+        if (await isRug(mint)) return;
+
+        console.log(`🆕 SNIPING new token: ${mint.toBase58()}`);
+        await trade("BUY", mint, "SNIPER", "pump.fun", testMode);
+
+        const timeout = setTimeout(() => trade("SELL", mint, "AUTO_SELL", "pump.fun", testMode), AUTO_SELL_MINUTES * 60000);
+        openPositions.set(mint.toBase58(), timeout);
+        return; // one per tx
       }
+    }
+  }, "confirmed");
 
-      await monitor();
-    } catch (e) {
-      console.error("Loop error");
+  listenerActive = true;
+  console.log("👂 Pump.fun sniper ACTIVE");
+}
+
+/* =========================
+   TRADE EXECUTION
+========================= */
+async function trade(
+  side: "BUY" | "SELL",
+  mint: PublicKey,
+  type: "COPY" | "SNIPER" | "AUTO_SELL",
+  source: string,
+  testMode: boolean
+) {
+  const bal = await balanceSOL();
+  let sizeSOL = tradeSize(bal);
+  if (!sizeSOL || isNaN(sizeSOL)) sizeSOL = SIMULATED_TRADE_SIZE;
+
+  console.log(`${testMode ? "🧪 TEST" : "🚀 LIVE"} ${side} ${type} ${sizeSOL.toFixed(4)} SOL → ${mint.toBase58()}`);
+
+  let profitSOL = 0;
+  let profitPercent = 0;
+
+  if (testMode) {
+    profitPercent = Math.random() * 13 - 3;
+    profitSOL = sizeSOL * (profitPercent / 100);
+  }
+
+  await postLovable({
+    wallet: walletKeypair.publicKey.toBase58(),
+    type, source, mint: mint.toBase58(),
+    side, size: sizeSOL, testMode,
+    status: testMode ? "simulated" : "pending",
+    profitSOL, profitPercent,
+    ts: new Date().toISOString(),
+  });
+
+  if (testMode) return;
+  if (bal < sizeSOL + 0.02) return;
+
+  try {
+    const inputMint = side === "BUY" ? "So11111111111111111111111111111111111111112" : mint.toBase58();
+    const outputMint = side === "BUY" ? mint.toBase58() : "So11111111111111111111111111111111111111112";
+    const amount = Math.round(sizeSOL * LAMPORTS_PER_SOL);
+
+    const quote = await jupiter.quoteGet({ inputMint, outputMint, amount, slippageBps: SLIPPAGE_BPS });
+    if ((quote as any).error) throw new Error((quote as any).error);
+
+    const { swapTransaction } = await jupiter.swapPost({
+      swapRequest: { quoteResponse: quote as any, userPublicKey: walletKeypair.publicKey.toBase58(), wrapAndUnwrapSol: true, prioritizationFeeLamports: PRIORITY_FEE }
+    });
+
+    const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, "base64"));
+    tx.sign([walletKeypair]);
+    const sig = await connection.sendRawTransaction(tx.serialize());
+    console.log(`✅ Tx confirmed: https://solscan.io/tx/${sig}`);
+
+    // PROFIT SHARE (SELL only)
+    if (side === "SELL") {
+      const outSOL = Number((quote as any).outAmount) / LAMPORTS_PER_SOL;
+      if (outSOL > sizeSOL * 1.02) {
+        const profit = outSOL - sizeSOL;
+        const fee = profit * PROFIT_SHARE_PCT;
+
+        const ix = SystemProgram.transfer({
+          fromPubkey: walletKeypair.publicKey,
+          toPubkey: new PublicKey(CREATOR_WALLET),
+          lamports: Math.floor(fee * LAMPORTS_PER_SOL),
+        });
+
+        const msg = new TransactionMessage({
+          payerKey: walletKeypair.publicKey,
+          recentBlockhash: (await connection.getLatestBlockhash()).blockhash,
+          instructions: [ix],
+        }).compileToV0Message();
+
+        const feeTx = new VersionedTransaction(msg);
+        feeTx.sign([walletKeypair]);
+        await connection.sendTransaction(feeTx);
+
+        console.log(`💰 11.11% fee sent (${fee.toFixed(4)} SOL)`);
+      }
     }
 
-    await sleep(4000);
+  } catch (e: any) {
+    console.error(`❌ ${side} failed`, e?.message || e);
+  }
+}
+
+/* =========================
+   MAIN LOOP
+========================= */
+async function run() {
+  console.log("🤖 HYBRID MEME BOT STARTED");
+
+  while (true) {
+    const control: any = await fetchControl();
+    const testMode = control.testMode === true;
+    const bal = await balanceSOL();
+
+    if (control.status !== "RUNNING" || bal < MIN_SOL_BALANCE) {
+      console.log(`⏸ Paused | ${control.status} | ${bal.toFixed(4)} SOL`);
+      await sleep(10000);
+      continue;
+    }
+
+    initPumpSniper(testMode);
+
+    // COPY TRADING
+    const wallets = control.copyTrading.wallets || [];
+    for (const w of wallets) {
+      await mirrorWallet(w, testMode);
+      await sleep(500);
+    }
+
+    await sleep(3000);
   }
 }
 

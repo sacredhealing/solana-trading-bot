@@ -1,9 +1,6 @@
 // =====================================================
 // HYBRID SNIPER + COPY BOT (AUTO FOMO + PUMP.FUN)
-// Robust & Hardened Version
-// - Handles RPC 429s and FOMO feed failures
-// - Safer profit-share logic
-// - Minor runtime guards
+// Fully fixed TypeScript + hardened runtime
 // =====================================================
 
 import {
@@ -71,16 +68,14 @@ async function fetchWithRetry(url: string, options: any = {}, retries = 5, delay
       return await r.json();
     } catch (e) {
       if (i === retries - 1) throw e;
-      await sleep(delay * (i + 1)); // exponential backoff
+      await sleep(delay * (i + 1));
     }
   }
 }
 
 async function fetchControl(): Promise<any> {
   try {
-    return await fetchWithRetry(LOVABLE_CONTROL_URL, {
-      headers: { apikey: SUPABASE_API_KEY },
-    }, 3, 500);
+    return await fetchWithRetry(LOVABLE_CONTROL_URL, { headers: { apikey: SUPABASE_API_KEY } }, 3, 500);
   } catch {
     return { status: "STOPPED", testMode: true };
   }
@@ -159,12 +154,12 @@ async function mirrorWallet(addr: string, testMode: boolean) {
     try { tx = await connection.getParsedTransaction(s.signature, { maxSupportedTransactionVersion: 0 }); } catch(e) { console.error("RPC error:", e); continue; }
     if (!tx?.meta) continue;
 
-    const transfers = tx.meta.postTokenBalances?.filter(b => b.owner === addr) || [];
+    const transfers = tx.meta.postTokenBalances?.filter((b: any) => b.owner === addr) || [];
     for (const bal of transfers) {
       const mint = new PublicKey(bal.mint);
       if (await isRug(mint)) continue;
 
-      const pre = tx.meta.preTokenBalances?.find(p => p.mint === bal.mint && p.owner === addr);
+      const pre = tx.meta.preTokenBalances?.find((p: any) => p.mint === bal.mint && p.owner === addr);
       const bought = Number(bal.uiTokenAmount.uiAmountString || 0) - (pre ? Number(pre.uiTokenAmount.uiAmountString || 0) : 0);
       if (bought > 0.01) {
         await trade("BUY", mint, "COPY", addr, testMode);
@@ -255,7 +250,6 @@ async function trade(
     const sig = await connection.sendRawTransaction(tx.serialize());
     console.log(`✅ Sent: https://solscan.io/tx/${sig}`);
 
-    // SAFER profit share: only if >= +2% SOL
     if (side === "SELL") {
       const outSOL = Number((quote as any).outAmount) / LAMPORTS_PER_SOL;
       if (outSOL > sizeSOL * 1.02) {

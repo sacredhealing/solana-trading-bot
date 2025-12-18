@@ -5,6 +5,7 @@
 // - Auto SELL
 // - 11.11% profit share
 // - RPC throttling
+// - LOVABLE DASHBOARD INTEGRATION
 // =====================================================
 
 import {
@@ -27,13 +28,18 @@ const PRIVATE_KEY = process.env.SOLANA_PRIVATE_KEY!;
 const CREATOR_WALLET = process.env.CREATOR_WALLET!;
 const JUPITER_API_KEY = process.env.JUPITER_API_KEY!;
 
+// Lovable Dashboard Integration
+const LOVABLE_API_URL = process.env.LOVABLE_API_URL!;
+const SUPABASE_API_KEY = process.env.SUPABASE_API_KEY!;
+const LOVABLE_CONTROL_URL = process.env.LOVABLE_CONTROL_URL!;
+
 /* =========================
    CONFIG
 ========================= */
 const MAX_RISK_PCT = 0.03;
 const MIN_SOL_BALANCE = 0.05;
 const SLIPPAGE_BPS = 200;
-const TRAILING_STOP_PCT = 0.10; // 10% trailing stop
+const TRAILING_STOP_PCT = 0.10;
 const PROFIT_SHARE_PCT = 0.1111;
 const RPC_DELAY_MS = 1200;
 
@@ -61,6 +67,7 @@ type Position = {
 
 const openPositions = new Map<string, Position>();
 let listenerActive = false;
+let botEnabled = true;
 
 /* =========================
    UTILS
@@ -72,6 +79,66 @@ async function getBalanceSOL() {
 }
 
 /* =========================
+   LOVABLE DASHBOARD INTEGRATION
+========================= */
+async function postLovable(data: any) {
+  try {
+    const response = await fetch(LOVABLE_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "apikey": SUPABASE_API_KEY,
+      },
+      body: JSON.stringify({
+        wallet: wallet.publicKey.toBase58(),
+        ...data,
+        ts: new Date().toISOString(),
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error("❌ postLovable failed:", response.status, errorText);
+    } else {
+      console.log("✅ Logged to Lovable dashboard");
+    }
+  } catch (e: any) {
+    console.error("❌ postLovable error:", e?.message || e);
+  }
+}
+
+async function checkDashboardControl(): Promise<boolean> {
+  try {
+    const response = await fetch(LOVABLE_CONTROL_URL, {
+      method: "GET",
+      headers: {
+        "apikey": SUPABASE_API_KEY,
+        "Content-Type": "application/json",
+      },
+    });
+
+    if (!response.ok) {
+      console.error("❌ Control check failed:", response.status);
+      return true; // Default to running if control check fails
+    }
+
+    const data = await response.json();
+    const status = data.status || data.botState?.status;
+    
+    if (status === "RUNNING") {
+      return true;
+    } else if (status === "STOPPED" || status === "PAUSED") {
+      return false;
+    }
+    
+    return true;
+  } catch (e: any) {
+    console.error("❌ Control check error:", e?.message || e);
+    return true; // Default to running if error
+  }
+}
+
+/* =========================
    REAL PRICE FROM JUPITER
 ========================= */
 async function getTokenPriceSOL(mint: string): Promise<number | null> {
@@ -79,7 +146,7 @@ async function getTokenPriceSOL(mint: string): Promise<number | null> {
     const quote = await jupiter.quoteGet({
       inputMint: mint,
       outputMint: SOL_MINT,
-      amount: 1_000_000, // 1 token unit approximation
+      amount: 1_000_000,
       slippageBps: 50,
     });
     return Number(quote.outAmount) / LAMPORTS_PER_SOL;
@@ -130,6 +197,11 @@ async function executeSwap(
    BUY
 ========================= */
 async function buyToken(mint: PublicKey) {
+  if (!botEnabled) {
+    console.log("⏸️ Bot is disabled, skipping buy");
+    return;
+  }
+
   const balance = await getBalanceSOL();
   const sizeSOL = Math.max(balance * MAX_RISK_PCT, 0.01);
   if (balance < sizeSOL + 0.02) return;
@@ -152,12 +224,28 @@ async function buyToken(mint: PublicKey) {
   });
 
   console.log(`🟢 BOUGHT ${mint.toBase58()} @ ${price.toFixed(6)} SOL`);
+
+  // Log BUY to Lovable dashboard
+  await postLovable({
+    side: "BUY",
+    mint: mint.toBase58(),
+    pair: `${mint.toBase58().slice(0, 6)}/SOL`,
+    action: "BUY",
+    size: sizeSOL,
+    source: "PUMP_SNIPER",
+    status: "CONFIRMED",
+    tx_signature: sig,
+    entry_price: price,
+    inputAmount: sizeSOL,
+  });
 }
 
 /* =========================
    SELL + PROFIT SHARE
 ========================= */
 async function sellToken(pos: Position) {
+  const exitPrice = await getTokenPriceSOL(pos.mint.toBase58());
+  
   const sig = await executeSwap(
     pos.mint.toBase58(),
     SOL_MINT,
@@ -167,6 +255,7 @@ async function sellToken(pos: Position) {
 
   const outSOL = await getBalanceSOL();
   const profit = Math.max(0, outSOL - pos.sizeSOL);
+  const profitPercent = pos.buyPrice > 0 ? ((exitPrice || 0) - pos.buyPrice) / pos.buyPrice * 100 : 0;
   const fee = profit * PROFIT_SHARE_PCT;
 
   if (fee > 0) {
@@ -188,6 +277,25 @@ async function sellToken(pos: Position) {
 
     console.log(`💰 PROFIT SHARE SENT: ${fee.toFixed(4)} SOL`);
   }
+
+  console.log(`🔴 SOLD ${pos.mint.toBase58()} | Profit: ${profit.toFixed(4)} SOL (${profitPercent.toFixed(2)}%)`);
+
+  // Log SELL to Lovable dashboard
+  await postLovable({
+    side: "SELL",
+    mint: pos.mint.toBase58(),
+    pair: `${pos.mint.toBase58().slice(0, 6)}/SOL`,
+    action: "SELL",
+    size: pos.sizeSOL,
+    source: "TRAILING_STOP",
+    status: "CONFIRMED",
+    tx_signature: sig,
+    entry_price: pos.buyPrice,
+    exit_price: exitPrice,
+    pnl: profit,
+    roi: profitPercent,
+    outputAmount: outSOL,
+  });
 
   openPositions.delete(pos.mint.toBase58());
 }
@@ -222,6 +330,7 @@ function startPumpSniper() {
 
   connection.onLogs(PUMP_FUN_PROGRAM, async log => {
     if (log.err) return;
+    if (!botEnabled) return;
 
     const tx = await connection.getParsedTransaction(log.signature, {
       maxSupportedTransactionVersion: 0,
@@ -246,12 +355,47 @@ function startPumpSniper() {
 ========================= */
 async function run() {
   console.log("🤖 BOT LIVE");
-  startPumpSniper();
+  console.log(`📍 Wallet: ${wallet.publicKey.toBase58()}`);
+  console.log(`🔗 Dashboard: Lovable integration enabled`);
+
+  // Log bot startup
+  await postLovable({
+    type: "STATUS",
+    status: "STARTED",
+    message: "Bot started and connected to dashboard",
+  });
 
   while (true) {
     try {
-      await trailingLoop();
-    } catch {}
+      // Check dashboard control status
+      const shouldRun = await checkDashboardControl();
+      
+      if (!shouldRun && botEnabled) {
+        console.log("⏸️ Dashboard says STOPPED, pausing bot...");
+        botEnabled = false;
+        await postLovable({
+          type: "STATUS",
+          status: "PAUSED",
+          message: "Bot paused via dashboard",
+        });
+      } else if (shouldRun && !botEnabled) {
+        console.log("▶️ Dashboard says RUNNING, resuming bot...");
+        botEnabled = true;
+        await postLovable({
+          type: "STATUS",
+          status: "RUNNING",
+          message: "Bot resumed via dashboard",
+        });
+      }
+
+      if (botEnabled) {
+        startPumpSniper();
+        await trailingLoop();
+      }
+    } catch (e: any) {
+      console.error("Loop error:", e?.message || e);
+    }
+    
     await sleep(3000);
   }
 }

@@ -1,5 +1,6 @@
 // =====================================================
-// HYBRID SNIPER + COPY BOT – Volume Monitoring + Multi-Positions + Bubble Maps Anti-Rug
+// HYBRID SNIPER + COPY BOT (AUTO FOMO + PUMP.FUN)
+// Final Stable Version – Fixed run Call + Clean Test Logging
 // =====================================================
 import {
   Connection,
@@ -11,7 +12,9 @@ import {
 import bs58 from "bs58";
 import { createJupiterApiClient } from "@jup-ag/api";
 
-/* ENV & CONFIG – same */
+/* =========================
+   ENV
+========================= */
 const RPC_URL = process.env.SOLANA_RPC_URL!;
 const PRIVATE_KEY = process.env.SOLANA_PRIVATE_KEY!;
 const JUPITER_API_KEY = process.env.JUPITER_API_KEY!;
@@ -20,82 +23,193 @@ const LOVABLE_API_URL = process.env.LOVABLE_API_URL!;
 const LOVABLE_CONTROL_URL = process.env.LOVABLE_CONTROL_URL!;
 const FOMO_WALLET_FEED = process.env.FOMO_WALLET_FEED!;
 
-const MAX_RISK_PCT = 0.03;
-const MIN_SOL_BALANCE = 0.05;
+/* =========================
+   USER RISK CONFIG
+========================= */
+const MAX_RISK_PCT = 0.03; // 3% of balance per trade
+const MIN_SOL_BALANCE = 0.05; // Pause bot if below
 const SLIPPAGE_BPS = 200;
 const PRIORITY_FEE = "auto";
-const TAKE_PROFIT_X = 3;
-const VOLUME_DROP_PCT = 0.5;
-const BUBBLE_MAPS_RUG_THRESHOLD = 20; // % top holder – if >20%, skip
+const AUTO_SELL_MINUTES = 10;
 
-/* SETUP – same */
+/* =========================
+   SETUP
+========================= */
+const connection = new Connection(RPC_URL, "confirmed");
+const walletKeypair = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
+const jupiter = createJupiterApiClient({ apiKey: JUPITER_API_KEY });
 
-/* VOLUME FROM DEXSCREENER */
-async function getVolume24h(mint: PublicKey): Promise<number> {
+const PUMP_FUN_PROGRAM = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+
+const seenTx: Set<string> = new Set();
+const openPositions: Map<string, NodeJS.Timeout> = new Map();
+let cachedFomoWallets: string[] = [];
+let lastFomoRefresh = 0;
+let listenerActive = false;
+
+/* =========================
+   UTILS
+========================= */
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+async function fetchControl() {
   try {
-    const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint.toBase58()}`);
-    const data = await r.json();
-    return data.pairs?.reduce((max: number, p: any) => Math.max(max, p.volume?.h24 || 0), 0) || 0;
+    const r = await fetch(LOVABLE_CONTROL_URL, { headers: { apikey: SUPABASE_API_KEY } });
+    if (!r.ok) return { status: "STOPPED", testMode: true };
+    return await r.json();
+  } catch {
+    return { status: "STOPPED", testMode: true };
+  }
+}
+
+async function postLovable(row: any) {
+  try {
+    await fetch(LOVABLE_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", apikey: SUPABASE_API_KEY },
+      body: JSON.stringify(row),
+    });
+  } catch {}
+}
+
+async function balanceSOL() {
+  try {
+    return (await connection.getBalance(walletKeypair.publicKey)) / LAMPORTS_PER_SOL;
   } catch {
     return 0;
   }
 }
 
-/* BUBBLE MAPS RUG CHECK (Free API) */
-async function isRug(mint: PublicKey): Promise<boolean> {
+function tradeSize(balance: number) {
+  return Math.max(balance * MAX_RISK_PCT, 0.01);
+}
+
+/* =========================
+   FOMO WALLETS – Robust
+========================= */
+async function fetchTopFomoWallets(): Promise<string[]> {
+  const now = Date.now();
+  if (now - lastFomoRefresh < 3600000 && cachedFomoWallets.length) return cachedFomoWallets;
+
   try {
-    const r = await fetch(`https://api.bubblemaps.io/solana/clusters/${mint.toBase58()}`);
+    const r = await fetch(FOMO_WALLET_FEED, { headers: { apikey: SUPABASE_API_KEY } });
+    if (!r.ok) throw new Error("Bad response");
     const data = await r.json();
-    const topHolderPct = data.clusters?.[0]?.percent || 0;
-    return topHolderPct > BUBBLE_MAPS_RUG_THRESHOLD;
-  } catch {
-    return true; // Safe skip on error
+
+    const rows = Array.isArray(data) ? data : data.data || [];
+    cachedFomoWallets = rows
+      .map((r: any) => r.wallet || r.address || r.pubkey || r.Wallet)
+      .filter((w?: string) => w && w.length > 30 && w.length < 50)
+      .slice(0, 30);
+
+    console.log(`🔥 Loaded ${cachedFomoWallets.length} FOMO wallets`);
+  } catch (e) {
+    console.error("FOMO load failed:", e);
+    cachedFomoWallets = [];
+  }
+  lastFomoRefresh = now;
+  return cachedFomoWallets;
+}
+
+/* =========================
+   RUG CHECK (Placeholder – improve later)
+========================= */
+async function isRug(mint: PublicKey): Promise<boolean> {
+  return false; // Allow all for now
+}
+
+/* =========================
+   COPY-TRADING
+========================= */
+async function mirrorWallet(addr: string, testMode: boolean) {
+  let pub: PublicKey;
+  try { pub = new PublicKey(addr); } catch { return; }
+
+  const sigs = await connection.getSignaturesForAddress(pub, { limit: 5 });
+  for (const s of sigs) {
+    if (seenTx.has(s.signature)) continue;
+    seenTx.add(s.signature);
+
+    const tx = await connection.getParsedTransaction(s.signature, { maxSupportedTransactionVersion: 0 });
+    if (!tx || !tx.meta) continue;
+
+    const transfers = tx.meta.postTokenBalances?.filter(b => b.owner === addr) || [];
+    for (const bal of transfers) {
+      const mint = new PublicKey(bal.mint);
+      if (await isRug(mint)) continue;
+
+      const pre = tx.meta.preTokenBalances?.find(p => p.mint === bal.mint && p.owner === addr);
+      const bought = Number(bal.uiTokenAmount.uiAmountString || 0) - (pre ? Number(pre.uiTokenAmount.uiAmountString || 0) : 0);
+      if (bought > 0.01) {
+        await trade("BUY", mint, "COPY", addr, testMode);
+      }
+    }
   }
 }
 
-/* MONITOR POSITION – Volume + Price */
-async function monitorPosition(mintStr: string, buyPrice: number, testMode: boolean) {
-  const mint = new PublicKey(mintStr);
-  let peakVolume = await getVolume24h(mint);
+/* =========================
+   PUMP.FUN SNIPER – Reliable Mint Detection
+========================= */
+function initPumpSniper(testMode: boolean) {
+  if (listenerActive) return;
 
-  const interval = setInterval(async () => {
-    const price = await getCurrentPrice(mint);
-    const volume = await getVolume24h(mint);
-    if (volume > peakVolume) peakVolume = volume;
+  connection.onLogs(
+    PUMP_FUN_PROGRAM,
+    async (log) => {
+      if (log.err) return;
 
-    if (price >= buyPrice * TAKE_PROFIT_X) {
-      console.log(`🎯 TP hit at ${TAKE_PROFIT_X}x`);
-      await trade("SELL", mint, "TAKE_PROFIT", "auto", testMode);
-      clearInterval(interval);
-      openPositions.delete(mintStr);
-      return;
-    }
+      const hasCreate = log.logs.some(l => l.includes("Instruction: Create"));
+      if (!hasCreate) return;
 
-    if (volume < peakVolume * VOLUME_DROP_PCT) {
-      console.log(`📉 Volume drop >${VOLUME_DROP_PCT*100}% – exit`);
-      await trade("SELL", mint, "VOLUME_DROP", "auto", testMode);
-      clearInterval(interval);
-      openPositions.delete(mintStr);
-    }
-  }, 15000); // 15s check
+      console.log(`🆕 New pump.fun launch detected (sig: ${log.signature})`);
 
-  openPositions.set(mintStr, { buyPrice, peakVolume, interval: interval });
+      const tx = await connection.getParsedTransaction(log.signature, { maxSupportedTransactionVersion: 0 });
+      if (!tx || !tx.meta?.postTokenBalances) return;
+
+      let mint: PublicKey | null = null;
+      for (const bal of tx.meta.postTokenBalances) {
+        if (Number(bal.uiTokenAmount.uiAmountString || 0) > 0) {
+          try {
+            mint = new PublicKey(bal.mint);
+            break;
+          } catch {}
+        }
+      }
+
+      if (!mint) {
+        console.log("⚠️ Could not extract mint – skipping");
+        return;
+      }
+
+      if (await isRug(mint)) {
+        console.log("🚫 Rug risk – skipping");
+        return;
+      }
+
+      await trade("BUY", mint, "SNIPER", "pump.fun", testMode);
+
+      const timeout = setTimeout(() => trade("SELL", mint, "SNIPER", "pump.fun", testMode), AUTO_SELL_MINUTES * 60000);
+      openPositions.set(mint.toBase58(), timeout);
+    },
+    "confirmed"
+  );
+
+  listenerActive = true;
+  console.log("👂 Pump.fun logs listener ACTIVE");
 }
 
-/* TRADE – Calls monitor on BUY */
+/* =========================
+   EXECUTION – With Low Balance Protection
+========================= */
 async function trade(
   side: "BUY" | "SELL",
   mint: PublicKey,
-  type: string,
+  type: "COPY" | "SNIPER",
   source: string,
   testMode: boolean
 ) {
   const currentBalance = await balanceSOL();
   let sizeSOL = tradeSize(currentBalance);
-
-  if (isNaN(sizeSOL) || sizeSOL <= 0) {
-    sizeSOL = 0.01;
-  }
 
   console.log(`${testMode ? "🧪 TEST" : "🚀 LIVE"} ${side} ${type} | ${sizeSOL.toFixed(4)} SOL → ${mint.toBase58()}`);
 
@@ -113,8 +227,9 @@ async function trade(
 
   if (testMode) return;
 
+  // Low balance protection
   if (currentBalance < (sizeSOL + 0.02)) {
-    console.log("Low balance – skip");
+    console.log(`⚠️ Low balance (${currentBalance.toFixed(4)} SOL) – skipping ${side} trade`);
     return;
   }
 
@@ -145,17 +260,39 @@ async function trade(
     tx.sign([walletKeypair]);
 
     const sig = await connection.sendRawTransaction(tx.serialize(), { maxRetries: 5 });
-    console.log(`✅ Tx: https://solscan.io/tx/${sig}`);
-
-    if (side === "BUY") {
-      const buyPrice = await getCurrentPrice(mint);
-      monitorPosition(mint.toBase58(), buyPrice, testMode);
-    }
+    console.log(`✅ Tx sent: https://solscan.io/tx/${sig}`);
   } catch (e: any) {
-    console.error(`❌ Trade failed: ${e.message}`);
+    console.error(`❌ ${side} failed: ${e.message || e}`);
   }
 }
 
-/* MAIN LOOP – same as before */
+/* =========================
+   MAIN LOOP
+========================= */
+async function run() {
+  console.log("🤖 FINAL STABLE HYBRID MEME BOT STARTED");
+
+  while (true) {
+    const control = await fetchControl();
+    const testMode = control.testMode === true;
+
+    const currentBal = await balanceSOL();
+    if (control.status !== "RUNNING" || currentBal < MIN_SOL_BALANCE) {
+      console.log(`⏸ Paused – Status: ${control.status}, Balance: ${currentBal.toFixed(4)} SOL`);
+      await sleep(10000);
+      continue;
+    }
+
+    initPumpSniper(testMode);
+
+    const wallets = await fetchTopFomoWallets();
+    for (const w of wallets) {
+      await mirrorWallet(w, testMode);
+      await sleep(500);
+    }
+
+    await sleep(3000);
+  }
+}
 
 run();

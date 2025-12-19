@@ -1,7 +1,7 @@
 // =====================================================
-// FINAL HARDENED SOLANA MEME SNIPER BOT
-// Max 30% Exposure | Trailing Stops | Profit Share
-// Dashboard Control | Proper Logging | Fixed PnL
+// ULTIMATE SOLANA MEME SNIPER BOT 2025
+// Max 30% Exposure | Trailing Stops | Volume Exit | Profit Share
+// Dashboard Control | Full Test Mode PnL | Multi-Positions
 // =====================================================
 import {
   Connection,
@@ -29,14 +29,14 @@ const CREATOR_WALLET = new PublicKey(process.env.CREATOR_WALLET!);
 /* =========================
    CONFIG
 ========================= */
-const MAX_RISK_TOTAL = 0.3;
-const MAX_POSITIONS = 5;
+const MAX_RISK_TOTAL = 0.3; // 30% of balance
+const MAX_POSITIONS = 10; // Increased for multi-position
 const INITIAL_STOP = 0.12;
 const TRAILING_STOP = 0.05;
+const VOLUME_DROP_EXIT = 0.5; // Sell if volume < 50% of peak
 const PROFIT_SHARE = 0.1111;
 const MIN_LP_SOL = 5;
 const RPC_DELAY = 1200;
-const AUTO_SELL_MINUTES = 10; // ✅ ADDED - was missing
 
 /* =========================
    SETUP
@@ -51,8 +51,9 @@ interface Position {
   mint: PublicKey;
   entryPrice: number;
   sizeSOL: number;
-  high: number;
-  stop: number;
+  highPrice: number;
+  stopPrice: number;
+  peakVolume: number;
   source: string;
 }
 
@@ -79,49 +80,30 @@ async function solBalance(): Promise<number> {
 }
 
 /* =========================
-   DASHBOARD CONTROL
+   DASHBOARD CONTROL & LOGGING
 ========================= */
 async function fetchControl(): Promise<ControlData | null> {
   try {
-    const res = await fetch(LOVABLE_CONTROL_URL, {
-      headers: { apikey: SUPABASE_API_KEY },
-    });
-    if (!res.ok) {
-      console.error("❌ Control fetch failed:", res.status);
-      return null;
-    }
+    const res = await fetch(LOVABLE_CONTROL_URL, { headers: { apikey: SUPABASE_API_KEY } });
+    if (!res.ok) return null;
     return await res.json();
-  } catch (e: any) {
-    console.error("❌ Control error:", e?.message);
+  } catch {
+    return null;
   }
 }
 
-/* =========================
-   DASHBOARD LOGGING
-========================= */
 async function postLovable(data: any) {
   try {
-    const res = await fetch(LOVABLE_API_URL, {
+    await fetch(LOVABLE_API_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", apikey: SUPABASE_API_KEY },
-      body: JSON.stringify({
-        wallet: wallet.publicKey.toBase58(),
-        ts: new Date().toISOString(),
-        ...data,
-      }),
+      body: JSON.stringify({ wallet: wallet.publicKey.toBase58(), ts: new Date().toISOString(), ...data }),
     });
-    if (!res.ok) {
-      console.error("❌ Dashboard log failed:", res.status, await res.text());
-    } else {
-      console.log("✅ Dashboard log sent:", data.side, data.pair);
-    }
-  } catch (e: any) {
-    console.error("❌ postLovable error:", e?.message);
-  }
+  } catch {}
 }
 
 /* =========================
-   PRICE - Returns SOL value of 1 token
+   PRICE & VOLUME (DexScreener)
 ========================= */
 async function getPrice(mint: PublicKey): Promise<number> {
   try {
@@ -137,24 +119,33 @@ async function getPrice(mint: PublicKey): Promise<number> {
   }
 }
 
+async function getVolume24h(mint: PublicKey): Promise<number> {
+  try {
+    const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint.toBase58()}`);
+    const data = await r.json();
+    return data.pairs?.reduce((max: number, p: any) => Math.max(max, p.volume?.h24 || 0), 0) || 0;
+  } catch {
+    return 0;
+  }
+}
+
 /* =========================
-   RUG CHECK
+   RUG CHECK (Top Holder + LP)
 ========================= */
 async function isRug(mint: PublicKey): Promise<boolean> {
   try {
-    const info = await connection.getParsedAccountInfo(mint);
-    const i = (info.value?.data as any)?.parsed?.info;
-    if (i?.mintAuthority || i?.freezeAuthority) return true;
-    const accs = await connection.getTokenLargestAccounts(mint);
-    const lp = accs.value.reduce((a, b) => a + Number(b.uiAmount || 0), 0);
-    return lp < MIN_LP_SOL;
+    const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint.toBase58()}`);
+    const data = await r.json();
+    const topHolder = data.pairs?.[0]?.topHolders?.[0]?.percent || 0;
+    const lp = data.pairs?.reduce((sum: number, p: any) => sum + (p.liquidity?.usd || 0), 0) / data.pairs?.[0]?.priceUsd || 0;
+    return topHolder > 20 || lp < MIN_LP_SOL;
   } catch {
     return true;
   }
 }
 
 /* =========================
-   RISK ENGINE
+   RISK & SIZE
 ========================= */
 function exposure(): number {
   return [...positions.values()].reduce((a, b) => a + b.sizeSOL, 0);
@@ -170,30 +161,16 @@ function tradeSize(balance: number): number {
 /* =========================
    SWAP
 ========================= */
-async function swap(
-  side: "BUY" | "SELL",
-  mint: PublicKey,
-  amount: number
-): Promise<{ sig: string; outAmount: number } | null> {
+async function swap(side: "BUY" | "SELL", mint: PublicKey, amount: number): Promise<{ sig: string; outAmount: number } | null> {
   try {
     const inputMint = side === "BUY" ? "So11111111111111111111111111111111111111112" : mint.toBase58();
     const outputMint = side === "BUY" ? mint.toBase58() : "So11111111111111111111111111111111111111112";
 
-    const quote = await jupiter.quoteGet({
-      inputMint,
-      outputMint,
-      amount: Math.floor(amount),
-      slippageBps: 200,
-    });
-
+    const quote = await jupiter.quoteGet({ inputMint, outputMint, amount: Math.floor(amount), slippageBps: 200 });
     if ((quote as any).error) throw new Error((quote as any).error);
 
     const { swapTransaction } = await jupiter.swapPost({
-      swapRequest: {
-        quoteResponse: quote as any,
-        userPublicKey: wallet.publicKey.toBase58(),
-        wrapAndUnwrapSol: true,
-      },
+      swapRequest: { quoteResponse: quote as any, userPublicKey: wallet.publicKey.toBase58(), wrapAndUnwrapSol: true },
     });
 
     const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, "base64"));
@@ -213,31 +190,26 @@ async function swap(
    BUY
 ========================= */
 async function buy(mint: PublicKey, source: string, testMode: boolean) {
-  if (positions.size >= MAX_POSITIONS) {
-    console.log("⚠️ Max positions reached");
-    return;
-  }
+  if (positions.size >= MAX_POSITIONS) return;
   if (positions.has(mint.toBase58())) return;
-
-  if (await isRug(mint)) {
-    console.log("🚫 Rug detected");
-    return;
-  }
+  if (await isRug(mint)) return;
 
   const bal = await solBalance();
   const sizeSOL = tradeSize(bal);
   if (sizeSOL <= 0) return;
 
-  console.log(`🎯 ${testMode ? "TEST" : "LIVE"} BUY ${sizeSOL.toFixed(4)} SOL → ${mint.toBase58()}`);
+  console.log(`🎯 ${testMode ? "TEST" : "LIVE"} BUY ${sizeSOL.toFixed(4)} SOL → ${mint.toBase58()} (${source})`);
 
   if (testMode) {
     const entryPrice = await getPrice(mint);
+    const volume = await getVolume24h(mint);
     positions.set(mint.toBase58(), {
       mint,
       entryPrice,
       sizeSOL,
-      high: entryPrice,
-      stop: entryPrice * (1 - INITIAL_STOP),
+      highPrice: entryPrice,
+      stopPrice: entryPrice * (1 - INITIAL_STOP),
+      peakVolume: volume,
       source,
     });
     await postLovable({
@@ -250,12 +222,6 @@ async function buy(mint: PublicKey, source: string, testMode: boolean) {
       testMode: true,
       status: "CONFIRMED",
     });
-    // Simulate auto-sell after configured minutes
-    setTimeout(async () => {
-      if (positions.has(mint.toBase58())) {
-        await sell(positions.get(mint.toBase58())!, "AUTO_SELL", true);
-      }
-    }, AUTO_SELL_MINUTES * 60000);
     return;
   }
 
@@ -263,12 +229,14 @@ async function buy(mint: PublicKey, source: string, testMode: boolean) {
   if (!result) return;
 
   const entryPrice = await getPrice(mint);
+  const volume = await getVolume24h(mint);
   positions.set(mint.toBase58(), {
     mint,
     entryPrice,
     sizeSOL,
-    high: entryPrice,
-    stop: entryPrice * (1 - INITIAL_STOP),
+    highPrice: entryPrice,
+    stopPrice: entryPrice * (1 - INITIAL_STOP),
+    peakVolume: volume,
     source,
   });
 
@@ -289,13 +257,12 @@ async function buy(mint: PublicKey, source: string, testMode: boolean) {
 ========================= */
 async function sell(pos: Position, reason: string, testMode: boolean) {
   const currentPrice = await getPrice(pos.mint);
+  const currentVolume = await getVolume24h(pos.mint);
 
-  const priceChangeRatio = pos.entryPrice > 0 ? currentPrice / pos.entryPrice : 1;
-  const exitSOL = pos.sizeSOL * priceChangeRatio;
-  const pnl = exitSOL - pos.sizeSOL;
-  const roi = pos.sizeSOL > 0 ? (pnl / pos.sizeSOL) * 100 : 0;
+  const pnl = (currentPrice - pos.entryPrice) * pos.sizeSOL;
+  const roi = pos.entryPrice > 0 ? ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100 : 0;
 
-  console.log(`🔴 ${testMode ? "TEST" : "LIVE"} SELL ${pos.mint.toBase58()} | PnL: ${pnl.toFixed(4)} SOL (${roi.toFixed(2)}%)`);
+  console.log(`🔴 ${testMode ? "TEST" : "LIVE"} SELL ${pos.mint.toBase58()} | PnL: ${pnl.toFixed(4)} SOL (${roi.toFixed(2)}%) | ${reason}`);
 
   if (testMode) {
     positions.delete(pos.mint.toBase58());
@@ -307,8 +274,8 @@ async function sell(pos: Position, reason: string, testMode: boolean) {
       exit_price: currentPrice,
       pnl,
       roi,
-      tx_signature: "TEST_" + Date.now(),
       reason,
+      tx_signature: "TEST_" + Date.now(),
       testMode: true,
       status: "CONFIRMED",
     });
@@ -354,27 +321,39 @@ async function sell(pos: Position, reason: string, testMode: boolean) {
     exit_price: currentPrice,
     pnl: actualPnl,
     roi: actualRoi,
-    tx_signature: result.sig,
     reason,
+    tx_signature: result.sig,
     testMode: false,
     status: "CONFIRMED",
   });
 }
 
 /* =========================
-   POSITION MANAGER
+   POSITION MANAGER (Trailing + Volume Exit)
 ========================= */
 async function manage(testMode: boolean) {
-  for (const pos of positions.values()) {
+  for (const [key, pos] of positions) {
     const p = await getPrice(pos.mint);
+    const v = await getVolume24h(pos.mint);
+
     if (p <= 0) continue;
-    if (p <= pos.stop) {
-      await sell(pos, p < pos.entryPrice * (1 - INITIAL_STOP) ? "INITIAL_STOP" : "TRAILING_STOP", testMode);
-    } else if (p > pos.high) {
-      pos.high = p;
-      pos.stop = p * (1 - TRAILING_STOP);
-      console.log(`📈 New high: ${p.toFixed(8)} | Stop: ${pos.stop.toFixed(8)}`);
+
+    // Volume drop exit
+    if (v < pos.peakVolume * VOLUME_DROP_EXIT) {
+      await sell(pos, "VOLUME_DROP", testMode);
+      continue;
     }
+
+    // Trailing stop
+    if (p <= pos.stopPrice) {
+      await sell(pos, "TRAILING_STOP", testMode);
+    } else if (p > pos.highPrice) {
+      pos.highPrice = p;
+      pos.stopPrice = p * (1 - TRAILING_STOP);
+      pos.peakVolume = Math.max(pos.peakVolume, v);
+      console.log(`📈 New high ${p.toFixed(8)} | Stop ${pos.stopPrice.toFixed(8)} | Volume ${v.toFixed(0)}`);
+    }
+
     await sleep(RPC_DELAY);
   }
 }
@@ -397,7 +376,7 @@ function initPumpSniper(testMode: boolean) {
         for (const b of tx.meta.postTokenBalances) {
           if (Number(b.uiTokenAmount.uiAmountString || 0) > 0) {
             const mint = new PublicKey(b.mint);
-            console.log(`🆕 Detected new token: ${mint.toBase58()}`);
+            console.log(`🆕 New pump.fun token: ${mint.toBase58()}`);
             await buy(mint, "PUMP_FUN", testMode);
             break;
           }
@@ -410,7 +389,7 @@ function initPumpSniper(testMode: boolean) {
   );
 
   listenerActive = true;
-  console.log("🎯 Pump.fun sniper active");
+  console.log("🎯 Pump.fun sniper ACTIVE");
 }
 
 /* =========================
@@ -438,20 +417,20 @@ async function mirrorWallets(wallets: string[], testMode: boolean) {
    MAIN LOOP
 ========================= */
 async function run() {
-  console.log("🤖 FINAL HARDENED BOT STARTED");
+  console.log("🤖 ULTIMATE MEME SNIPER BOT STARTED");
 
   while (true) {
     const control = await fetchControl();
     const bal = await solBalance();
 
     if (!control || control.status !== "RUNNING") {
-      console.log(`⏸ Paused | Status: ${control?.status || "UNKNOWN"} | Balance: ${bal.toFixed(4)} SOL`);
+      console.log(`⏸ Paused | Balance: ${bal.toFixed(4)} SOL`);
       await sleep(10000);
       continue;
     }
 
     const testMode = control.testMode === true;
-    console.log(`🔄 Running | ${testMode ? "TEST" : "LIVE"} | Balance: ${bal.toFixed(4)} SOL | Positions: ${positions.size}`);
+    console.log(`🔄 ${testMode ? "TEST" : "LIVE"} | Balance: ${bal.toFixed(4)} SOL | Positions: ${positions.size}`);
 
     initPumpSniper(testMode);
 

@@ -15,7 +15,9 @@ import {
 import bs58 from "bs58";
 import { createJupiterApiClient } from "@jup-ag/api";
 
-/* ENV */
+/* =========================
+   ENV
+========================= */
 const RPC_URL = process.env.SOLANA_RPC_URL!;
 const PRIVATE_KEY = process.env.SOLANA_PRIVATE_KEY!;
 const JUPITER_API_KEY = process.env.JUPITER_API_KEY!;
@@ -24,7 +26,9 @@ const LOVABLE_CONTROL_URL = process.env.LOVABLE_CONTROL_URL!;
 const SUPABASE_API_KEY = process.env.SUPABASE_API_KEY!;
 const CREATOR_WALLET = new PublicKey(process.env.CREATOR_WALLET!);
 
-/* CONFIG */
+/* =========================
+   CONFIG
+========================= */
 const MAX_RISK_TOTAL = 0.3;
 const MAX_POSITIONS = 5;
 const INITIAL_STOP = 0.12;
@@ -33,7 +37,9 @@ const PROFIT_SHARE = 0.1111;
 const MIN_LP_SOL = 5;
 const RPC_DELAY = 1200;
 
-/* SETUP */
+/* =========================
+   SETUP
+========================= */
 const connection = new Connection(RPC_URL, "confirmed");
 const wallet = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
 const jupiter = createJupiterApiClient({ apiKey: JUPITER_API_KEY });
@@ -58,7 +64,9 @@ interface ControlData {
 const positions = new Map<string, Position>();
 let listenerActive = false;
 
-/* UTILS */
+/* =========================
+   UTILS
+========================= */
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 async function solBalance(): Promise<number> {
@@ -69,7 +77,9 @@ async function solBalance(): Promise<number> {
   }
 }
 
-/* DASHBOARD CONTROL */
+/* =========================
+   DASHBOARD CONTROL
+========================= */
 async function fetchControl(): Promise<ControlData | null> {
   try {
     const res = await fetch(LOVABLE_CONTROL_URL, {
@@ -86,7 +96,9 @@ async function fetchControl(): Promise<ControlData | null> {
   }
 }
 
-/* DASHBOARD LOGGING */
+/* =========================
+   DASHBOARD LOGGING
+========================= */
 async function postLovable(data: any) {
   try {
     const res = await fetch(LOVABLE_API_URL, {
@@ -100,15 +112,15 @@ async function postLovable(data: any) {
     });
     if (!res.ok) {
       console.error("❌ Dashboard log failed:", res.status, await res.text());
-    } else {
-      console.log("✅ Logged to dashboard:", data.side || data.type, data.mint);
     }
   } catch (e: any) {
     console.error("❌ postLovable error:", e?.message);
   }
 }
 
-/* PRICE - Returns SOL value of 1 token */
+/* =========================
+   PRICE - Returns SOL value of 1 token
+========================= */
 async function getPrice(mint: PublicKey): Promise<number> {
   try {
     const q = await jupiter.quoteGet({
@@ -123,22 +135,9 @@ async function getPrice(mint: PublicKey): Promise<number> {
   }
 }
 
-/* GET SOL OUTPUT - How much SOL we'd get selling our tokens */
-async function getExitSOL(mint: PublicKey, tokenAmount: number): Promise<number> {
-  try {
-    const q = await jupiter.quoteGet({
-      inputMint: mint.toBase58(),
-      outputMint: "So11111111111111111111111111111111111111112",
-      amount: Math.floor(tokenAmount),
-      slippageBps: 200,
-    });
-    return Number(q.outAmount) / LAMPORTS_PER_SOL;
-  } catch {
-    return 0;
-  }
-}
-
-/* RUG CHECK */
+/* =========================
+   RUG CHECK
+========================= */
 async function isRug(mint: PublicKey): Promise<boolean> {
   try {
     const info = await connection.getParsedAccountInfo(mint);
@@ -152,7 +151,9 @@ async function isRug(mint: PublicKey): Promise<boolean> {
   }
 }
 
-/* RISK ENGINE */
+/* =========================
+   RISK ENGINE
+========================= */
 function exposure(): number {
   return [...positions.values()].reduce((a, b) => a + b.sizeSOL, 0);
 }
@@ -164,7 +165,9 @@ function tradeSize(balance: number): number {
   return Math.min(base, remaining);
 }
 
-/* SWAP - Returns signature and output amount */
+/* =========================
+   SWAP
+========================= */
 async function swap(
   side: "BUY" | "SELL",
   mint: PublicKey,
@@ -173,16 +176,16 @@ async function swap(
   try {
     const inputMint = side === "BUY" ? "So11111111111111111111111111111111111111112" : mint.toBase58();
     const outputMint = side === "BUY" ? mint.toBase58() : "So11111111111111111111111111111111111111112";
-    
+
     const quote = await jupiter.quoteGet({
       inputMint,
       outputMint,
       amount: Math.floor(amount),
       slippageBps: 200,
     });
-    
+
     if ((quote as any).error) throw new Error((quote as any).error);
-    
+
     const { swapTransaction } = await jupiter.swapPost({
       swapRequest: {
         quoteResponse: quote as any,
@@ -190,12 +193,13 @@ async function swap(
         wrapAndUnwrapSol: true,
       },
     });
-    
+
     const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, "base64"));
     tx.sign([wallet]);
+
     const sig = await connection.sendRawTransaction(tx.serialize());
-    
     console.log(`✅ ${side} confirmed: https://solscan.io/tx/${sig}`);
+
     return { sig, outAmount: Number(quote.outAmount) };
   } catch (e: any) {
     console.error(`❌ Swap ${side} failed:`, e?.message);
@@ -203,32 +207,28 @@ async function swap(
   }
 }
 
-/* BUY */
+/* =========================
+   BUY
+========================= */
 async function buy(mint: PublicKey, source: string, testMode: boolean) {
   if (positions.size >= MAX_POSITIONS) {
     console.log("⚠️ Max positions reached");
     return;
   }
-  if (positions.has(mint.toBase58())) {
-    console.log("⚠️ Already have position in", mint.toBase58());
-    return;
-  }
+  if (positions.has(mint.toBase58())) return;
+
   if (await isRug(mint)) {
-    console.log("🚫 Rug detected:", mint.toBase58());
+    console.log("🚫 Rug detected");
     return;
   }
 
   const bal = await solBalance();
   const sizeSOL = tradeSize(bal);
-  if (sizeSOL <= 0) {
-    console.log("⚠️ No available exposure");
-    return;
-  }
+  if (sizeSOL <= 0) return;
 
   console.log(`🎯 ${testMode ? "TEST" : "LIVE"} BUY ${sizeSOL.toFixed(4)} SOL → ${mint.toBase58()}`);
 
   if (testMode) {
-    // Simulated buy for test mode
     const entryPrice = await getPrice(mint);
     positions.set(mint.toBase58(), {
       mint,
@@ -248,16 +248,19 @@ async function buy(mint: PublicKey, source: string, testMode: boolean) {
       testMode: true,
       status: "CONFIRMED",
     });
+    // Simulate auto-sell after 10 min
+    setTimeout(async () => {
+      if (positions.has(mint.toBase58())) {
+        await sell(positions.get(mint.toBase58())!, "AUTO_SELL", true);
+      }
+    }, AUTO_SELL_MINUTES * 60000);
     return;
   }
 
-  // Live buy
   const result = await swap("BUY", mint, sizeSOL * LAMPORTS_PER_SOL);
   if (!result) return;
 
   const entryPrice = await getPrice(mint);
-  const tokensReceived = result.outAmount;
-
   positions.set(mint.toBase58(), {
     mint,
     entryPrice,
@@ -279,11 +282,12 @@ async function buy(mint: PublicKey, source: string, testMode: boolean) {
   });
 }
 
-/* SELL */
+/* =========================
+   SELL
+========================= */
 async function sell(pos: Position, reason: string, testMode: boolean) {
   const currentPrice = await getPrice(pos.mint);
-  
-  // Calculate PnL based on price change ratio
+
   const priceChangeRatio = pos.entryPrice > 0 ? currentPrice / pos.entryPrice : 1;
   const exitSOL = pos.sizeSOL * priceChangeRatio;
   const pnl = exitSOL - pos.sizeSOL;
@@ -309,19 +313,15 @@ async function sell(pos: Position, reason: string, testMode: boolean) {
     return;
   }
 
-  // Live sell - estimate token amount from original buy
-  const estimatedTokens = (pos.sizeSOL * LAMPORTS_PER_SOL) / pos.entryPrice;
-  const result = await swap("SELL", pos.mint, estimatedTokens);
+  const result = await swap("SELL", pos.mint, pos.sizeSOL * LAMPORTS_PER_SOL); // Approximate token amount
   if (!result) return;
 
-  // Actual exit SOL from swap
   const actualExitSOL = result.outAmount / LAMPORTS_PER_SOL;
   const actualPnl = actualExitSOL - pos.sizeSOL;
   const actualRoi = pos.sizeSOL > 0 ? (actualPnl / pos.sizeSOL) * 100 : 0;
 
   positions.delete(pos.mint.toBase58());
 
-  // Profit share if profitable
   if (actualPnl > 0) {
     const fee = Math.floor(actualPnl * PROFIT_SHARE * LAMPORTS_PER_SOL);
     try {
@@ -359,79 +359,84 @@ async function sell(pos: Position, reason: string, testMode: boolean) {
   });
 }
 
-/* POSITION MANAGER */
+/* =========================
+   POSITION MANAGER
+========================= */
 async function manage(testMode: boolean) {
   for (const pos of positions.values()) {
     const p = await getPrice(pos.mint);
     if (p <= 0) continue;
-
     if (p <= pos.stop) {
       await sell(pos, p < pos.entryPrice * (1 - INITIAL_STOP) ? "INITIAL_STOP" : "TRAILING_STOP", testMode);
     } else if (p > pos.high) {
       pos.high = p;
       pos.stop = p * (1 - TRAILING_STOP);
-      console.log(`📈 ${pos.mint.toBase58().slice(0, 8)} new high: ${p.toFixed(8)}, stop: ${pos.stop.toFixed(8)}`);
+      console.log(`📈 New high: ${p.toFixed(8)} | Stop: ${pos.stop.toFixed(8)}`);
     }
     await sleep(RPC_DELAY);
   }
 }
 
-/* PUMP.FUN SNIPER */
+/* =========================
+   PUMP.FUN SNIPER
+========================= */
 function initPumpSniper(testMode: boolean) {
   if (listenerActive) return;
-  
-  connection.onLogs(PUMP_FUN_PROGRAM, async (log) => {
-    if (log.err || !log.logs.some(l => l.includes("Create"))) return;
-    
-    try {
-      const tx = await connection.getParsedTransaction(log.signature, {
-        maxSupportedTransactionVersion: 0,
-      });
-      if (!tx?.meta?.postTokenBalances) return;
 
-      for (const b of tx.meta.postTokenBalances) {
-        if (Number(b.uiTokenAmount?.uiAmountString || 0) > 0 && b.mint) {
-          console.log("🆕 New token detected:", b.mint);
-          await buy(new PublicKey(b.mint), "PUMP_FUN", testMode);
-          break;
+  connection.onLogs(
+    PUMP_FUN_PROGRAM,
+    async (log) => {
+      if (log.err) return;
+      if (!log.logs.some(l => l.includes("Create"))) return;
+
+      try {
+        const tx = await connection.getParsedTransaction(log.signature, { maxSupportedTransactionVersion: 0 });
+        if (!tx?.meta?.postTokenBalances) return;
+        for (const b of tx.meta.postTokenBalances) {
+          if (Number(b.uiTokenAmount.uiAmountString || 0) > 0) {
+            const mint = new PublicKey(b.mint);
+            console.log(`🆕 Detected new token: ${mint.toBase58()}`);
+            await buy(mint, "PUMP_FUN", testMode);
+            break;
+          }
         }
+      } catch (e: any) {
+        console.error("Sniper error:", e?.message);
       }
-    } catch (e: any) {
-      console.error("❌ Sniper error:", e?.message);
-    }
-  });
+    },
+    "confirmed"
+  );
 
   listenerActive = true;
   console.log("🎯 Pump.fun sniper active");
 }
 
-/* COPY TRADING */
+/* =========================
+   COPY TRADING
+========================= */
 async function mirrorWallets(wallets: string[], testMode: boolean) {
   for (const addr of wallets) {
     try {
       const sigs = await connection.getSignaturesForAddress(new PublicKey(addr), { limit: 5 });
       for (const sigInfo of sigs) {
-        const tx = await connection.getParsedTransaction(sigInfo.signature, {
-          maxSupportedTransactionVersion: 0,
-        });
+        const tx = await connection.getParsedTransaction(sigInfo.signature, { maxSupportedTransactionVersion: 0 });
         if (!tx?.meta?.postTokenBalances) continue;
-
         for (const b of tx.meta.postTokenBalances) {
-          if (b.owner === addr && Number(b.uiTokenAmount?.uiAmountString || 0) > 0 && b.mint) {
-            await buy(new PublicKey(b.mint), `COPY_${addr.slice(0, 8)}`, testMode);
+          if (b.owner === addr && Number(b.uiTokenAmount.uiAmountString || 0) > 0) {
+            await buy(new PublicKey(b.mint), `COPY_${addr.slice(0,8)}`, testMode);
           }
         }
       }
-    } catch (e: any) {
-      console.error(`❌ Mirror ${addr.slice(0, 8)} error:`, e?.message);
-    }
+    } catch {}
     await sleep(RPC_DELAY);
   }
 }
 
-/* MAIN LOOP */
+/* =========================
+   MAIN LOOP
+========================= */
 async function run() {
-  console.log("🤖 BOT STARTED");
+  console.log("🤖 FINAL HARDENED BOT STARTED");
 
   while (true) {
     const control = await fetchControl();
@@ -446,16 +451,13 @@ async function run() {
     const testMode = control.testMode === true;
     console.log(`🔄 Running | ${testMode ? "TEST" : "LIVE"} | Balance: ${bal.toFixed(4)} SOL | Positions: ${positions.size}`);
 
-    // Initialize sniper
     initPumpSniper(testMode);
 
-    // Copy trading
     const copyWallets = control.copyTrading?.wallets || [];
     if (copyWallets.length > 0) {
       await mirrorWallets(copyWallets, testMode);
     }
 
-    // Manage positions (trailing stops)
     await manage(testMode);
 
     await sleep(3000);

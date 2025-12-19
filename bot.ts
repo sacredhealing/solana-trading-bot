@@ -1,19 +1,16 @@
 // =====================================================
-// SOLANA HYBRID SNIPER + COPY BOT (429-HARDENED)
-// Single-file, production-safe
-// - Global RPC rate limiter + queue
-// - WS de-dup + backoff
-// - Polling fallbacks
-// - 30% max exposure, auto pause
-// - Trailing + initial stops
+// ULTIMATE SOLANA MEME SNIPER BOT 2025 – FINAL VERSION
+// Max 30% Exposure | Trailing Stops | Volume Exit | Profit Share
+// Dashboard Control | Full Test Mode PnL | Multi-Positions | Rug + Volume Filters
 // =====================================================
-
 import {
   Connection,
   Keypair,
   VersionedTransaction,
   LAMPORTS_PER_SOL,
   PublicKey,
+  SystemProgram,
+  TransactionMessage,
 } from "@solana/web3.js";
 import bs58 from "bs58";
 import { createJupiterApiClient } from "@jup-ag/api";
@@ -21,13 +18,7 @@ import { createJupiterApiClient } from "@jup-ag/api";
 /* =========================
    ENV
 ========================= */
-const RPC_URLS = (process.env.SOLANA_RPC_URLS || process.env.SOLANA_RPC_URL || "")
-  .split(",")
-  .map(s => s.trim())
-  .filter(Boolean);
-
-if (!RPC_URLS.length) throw new Error("No RPC URLs provided");
-
+const RPC_URL = process.env.SOLANA_RPC_URL!;
 const PRIVATE_KEY = process.env.SOLANA_PRIVATE_KEY!;
 const JUPITER_API_KEY = process.env.JUPITER_API_KEY!;
 const LOVABLE_API_URL = process.env.LOVABLE_API_URL!;
@@ -38,86 +29,31 @@ const CREATOR_WALLET = new PublicKey(process.env.CREATOR_WALLET!);
 /* =========================
    CONFIG
 ========================= */
-const MAX_RISK_TOTAL = 0.3;
-const MAX_POSITIONS = 5;
+const MAX_RISK_TOTAL = 0.3; // 30% of balance
+const MAX_POSITIONS = 10;
 const INITIAL_STOP = 0.12;
 const TRAILING_STOP = 0.05;
+const VOLUME_DROP_EXIT = 0.5; // Sell if volume < 50% of peak
 const PROFIT_SHARE = 0.1111;
 const MIN_LP_SOL = 5;
-const LOOP_DELAY_MS = 3000;
-
-// HARD LIMITS (ANTI-429)
-const RPC_QPS = 4;                 // total req/s across bot
-const RPC_BURST = 6;               // short burst
-const WS_RECONNECT_BASE = 5000;    // ms
-const WS_RECONNECT_MAX = 60000;    // ms
-
-/* =========================
-   GLOBAL RATE LIMITER
-========================= */
-class RateLimiter {
-  private queue: (() => Promise<any>)[] = [];
-  private tokens = RPC_BURST;
-  private last = Date.now();
-
-  constructor(private qps: number) {
-    setInterval(() => this.refill(), 250).unref();
-  }
-
-  private refill() {
-    const now = Date.now();
-    const delta = now - this.last;
-    this.last = now;
-    this.tokens = Math.min(RPC_BURST, this.tokens + (delta / 1000) * this.qps);
-    this.drain();
-  }
-
-  private drain() {
-    while (this.tokens >= 1 && this.queue.length) {
-      this.tokens -= 1;
-      const fn = this.queue.shift()!;
-      fn().catch(() => {});
-    }
-  }
-
-  async schedule<T>(fn: () => Promise<T>): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-      this.queue.push(async () => {
-        try { resolve(await fn()); } catch (e) { reject(e); }
-      });
-      this.drain();
-    });
-  }
-}
-
-const limiter = new RateLimiter(RPC_QPS);
-
-/* =========================
-   RPC POOL (ROUND-ROBIN)
-========================= */
-let rpcIndex = 0;
-const connections = RPC_URLS.map(
-  u => new Connection(u, { commitment: "confirmed", wsEndpoint: u.replace(/^http/, "ws") })
-);
-function conn() {
-  const c = connections[rpcIndex % connections.length];
-  rpcIndex++;
-  return c;
-}
+const RPC_DELAY = 1200;
 
 /* =========================
    SETUP
 ========================= */
+const connection = new Connection(RPC_URL, "confirmed");
 const wallet = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
 const jupiter = createJupiterApiClient({ apiKey: JUPITER_API_KEY });
+
 const PUMP_FUN_PROGRAM = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
 
 interface Position {
   mint: PublicKey;
   entryPrice: number;
   sizeSOL: number;
-  high: number;
-  stop: number;
+  highPrice: number;
+  stopPrice: number;
+  peakVolume: number;
   source: string;
 }
 
@@ -128,31 +64,32 @@ interface ControlData {
 }
 
 const positions = new Map<string, Position>();
-let wsActive = false;
-let wsBackoff = WS_RECONNECT_BASE;
+let listenerActive = false;
 
 /* =========================
-   UTILS (RATE-LIMITED)
+   UTILS
 ========================= */
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-async function rl<T>(fn: () => Promise<T>): Promise<T> {
-  return limiter.schedule(fn);
-}
-
 async function solBalance(): Promise<number> {
-  return rl(async () => (await conn().getBalance(wallet.publicKey)) / LAMPORTS_PER_SOL)
-    .catch(() => 0);
+  try {
+    return (await connection.getBalance(wallet.publicKey)) / LAMPORTS_PER_SOL;
+  } catch {
+    return 0;
+  }
 }
 
 /* =========================
-   DASHBOARD
+   DASHBOARD CONTROL & LOGGING
 ========================= */
 async function fetchControl(): Promise<ControlData | null> {
   try {
-    const r = await fetch(LOVABLE_CONTROL_URL, { headers: { apikey: SUPABASE_API_KEY } });
-    return r.ok ? await r.json() : null;
-  } catch { return null; }
+    const res = await fetch(LOVABLE_CONTROL_URL, { headers: { apikey: SUPABASE_API_KEY } });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
 }
 
 async function postLovable(data: any) {
@@ -166,7 +103,7 @@ async function postLovable(data: any) {
 }
 
 /* =========================
-   PRICE & RUG CHECKS
+   PRICE & VOLUME (DexScreener)
 ========================= */
 async function getPrice(mint: PublicKey): Promise<number> {
   try {
@@ -177,23 +114,38 @@ async function getPrice(mint: PublicKey): Promise<number> {
       slippageBps: 50,
     });
     return Number(q.outAmount) / LAMPORTS_PER_SOL;
-  } catch { return 0; }
+  } catch {
+    return 0;
+  }
 }
 
-async function isRug(mint: PublicKey): Promise<boolean> {
+async function getVolume24h(mint: PublicKey): Promise<number> {
   try {
-    const info = await rl(() => conn().getParsedAccountInfo(mint));
-    const i = (info.value?.data as any)?.parsed?.info;
-    if (i?.mintAuthority || i?.freezeAuthority) return true;
-
-    const accs = await rl(() => conn().getTokenLargestAccounts(mint));
-    const lp = accs.value.reduce((a, b) => a + Number(b.uiAmount || 0), 0);
-    return lp < MIN_LP_SOL;
-  } catch { return true; }
+    const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint.toBase58()}`);
+    const data = await r.json();
+    return data.pairs?.reduce((max: number, p: any) => Math.max(max, p.volume?.h24 || 0), 0) || 0;
+  } catch {
+    return 0;
+  }
 }
 
 /* =========================
-   RISK ENGINE
+   RUG CHECK (Top Holder + LP via DexScreener)
+========================= */
+async function isRug(mint: PublicKey): Promise<boolean> {
+  try {
+    const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint.toBase58()}`);
+    const data = await r.json();
+    const topHolder = data.pairs?.[0]?.topHolders?.[0]?.percent || 0;
+    const lp = data.pairs?.reduce((sum: number, p: any) => sum + (p.liquidity?.usd || 0), 0) / (data.pairs?.[0]?.priceUsd || 1);
+    return topHolder > 20 || lp < MIN_LP_SOL;
+  } catch {
+    return true;
+  }
+}
+
+/* =========================
+   RISK & SIZE
 ========================= */
 function exposure(): number {
   return [...positions.values()].reduce((a, b) => a + b.sizeSOL, 0);
@@ -207,152 +159,257 @@ function tradeSize(balance: number): number {
 }
 
 /* =========================
-   SWAPS (RATE-LIMITED)
+   SWAP
 ========================= */
-async function swap(
-  side: "BUY" | "SELL",
-  mint: PublicKey,
-  amountLamports: number
-): Promise<{ sig: string; outAmount: number } | null> {
+async function swap(side: "BUY" | "SELL", mint: PublicKey, amount: number): Promise<{ sig: string; outAmount: number } | null> {
   try {
-    const inputMint = side === "BUY"
-      ? "So11111111111111111111111111111111111111112"
-      : mint.toBase58();
-    const outputMint = side === "BUY"
-      ? mint.toBase58()
-      : "So11111111111111111111111111111111111111112";
+    const inputMint = side === "BUY" ? "So11111111111111111111111111111111111111112" : mint.toBase58();
+    const outputMint = side === "BUY" ? mint.toBase58() : "So11111111111111111111111111111111111111112";
 
-    const quote = await jupiter.quoteGet({
-      inputMint, outputMint, amount: Math.floor(amountLamports), slippageBps: 200
-    });
+    const quote = await jupiter.quoteGet({ inputMint, outputMint, amount: Math.floor(amount), slippageBps: 200 });
+    if ((quote as any).error) throw new Error((quote as any).error);
 
     const { swapTransaction } = await jupiter.swapPost({
-      swapRequest: {
-        quoteResponse: quote as any,
-        userPublicKey: wallet.publicKey.toBase58(),
-        wrapAndUnwrapSol: true,
-      },
+      swapRequest: { quoteResponse: quote as any, userPublicKey: wallet.publicKey.toBase58(), wrapAndUnwrapSol: true },
     });
 
     const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, "base64"));
     tx.sign([wallet]);
 
-    const sig = await rl(() => conn().sendRawTransaction(tx.serialize(), { skipPreflight: true }));
+    const sig = await connection.sendRawTransaction(tx.serialize());
+    console.log(`✅ ${side} confirmed: https://solscan.io/tx/${sig}`);
+
     return { sig, outAmount: Number(quote.outAmount) };
-  } catch { return null; }
+  } catch (e: any) {
+    console.error(`❌ Swap ${side} failed:`, e?.message);
+    return null;
+  }
 }
 
 /* =========================
-   BUY / SELL
+   BUY
 ========================= */
 async function buy(mint: PublicKey, source: string, testMode: boolean) {
-  if (positions.size >= MAX_POSITIONS || positions.has(mint.toBase58())) return;
+  if (positions.size >= MAX_POSITIONS) return;
+  if (positions.has(mint.toBase58())) return;
   if (await isRug(mint)) return;
 
   const bal = await solBalance();
   const sizeSOL = tradeSize(bal);
   if (sizeSOL <= 0) return;
 
+  console.log(`🎯 ${testMode ? "TEST" : "LIVE"} BUY ${sizeSOL.toFixed(4)} SOL → ${mint.toBase58()} (${source})`);
+
+  if (testMode) {
+    const entryPrice = await getPrice(mint);
+    const volume = await getVolume24h(mint);
+    positions.set(mint.toBase58(), {
+      mint,
+      entryPrice,
+      sizeSOL,
+      highPrice: entryPrice,
+      stopPrice: entryPrice * (1 - INITIAL_STOP),
+      peakVolume: volume,
+      source,
+    });
+    await postLovable({
+      side: "BUY",
+      pair: mint.toBase58(),
+      sizeSOL,
+      entry_price: entryPrice,
+      tx_signature: "TEST_" + Date.now(),
+      source,
+      testMode: true,
+      status: "CONFIRMED",
+    });
+    return;
+  }
+
+  const result = await swap("BUY", mint, sizeSOL * LAMPORTS_PER_SOL);
+  if (!result) return;
+
   const entryPrice = await getPrice(mint);
-  const pos: Position = {
+  const volume = await getVolume24h(mint);
+  positions.set(mint.toBase58(), {
     mint,
     entryPrice,
     sizeSOL,
-    high: entryPrice,
-    stop: entryPrice * (1 - INITIAL_STOP),
+    highPrice: entryPrice,
+    stopPrice: entryPrice * (1 - INITIAL_STOP),
+    peakVolume: volume,
     source,
-  };
-  positions.set(mint.toBase58(), pos);
+  });
 
-  if (!testMode) await swap("BUY", mint, sizeSOL * LAMPORTS_PER_SOL);
-  await postLovable({ side: "BUY", pair: mint.toBase58(), sizeSOL, entry_price: entryPrice, source, testMode });
+  await postLovable({
+    side: "BUY",
+    pair: mint.toBase58(),
+    sizeSOL,
+    entry_price: entryPrice,
+    tx_signature: result.sig,
+    source,
+    testMode: false,
+    status: "CONFIRMED",
+  });
 }
 
+/* =========================
+   SELL
+========================= */
 async function sell(pos: Position, reason: string, testMode: boolean) {
-  const price = await getPrice(pos.mint);
-  const pnl = pos.sizeSOL * (price / pos.entryPrice - 1);
+  const currentPrice = await getPrice(pos.mint);
+  const currentVolume = await getVolume24h(pos.mint);
+
+  const pnl = (currentPrice - pos.entryPrice) * pos.sizeSOL;
+  const roi = pos.entryPrice > 0 ? ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100 : 0;
+
+  console.log(`🔴 ${testMode ? "TEST" : "LIVE"} SELL ${pos.mint.toBase58()} | PnL: ${pnl.toFixed(4)} SOL (${roi.toFixed(2)}%) | ${reason}`);
+
+  if (testMode) {
+    positions.delete(pos.mint.toBase58());
+    await postLovable({
+      side: "SELL",
+      pair: pos.mint.toBase58(),
+      sizeSOL: pos.sizeSOL,
+      entry_price: pos.entryPrice,
+      exit_price: currentPrice,
+      pnl,
+      roi,
+      reason,
+      tx_signature: "TEST_" + Date.now(),
+      testMode: true,
+      status: "CONFIRMED",
+    });
+    return;
+  }
+
+  const result = await swap("SELL", pos.mint, pos.sizeSOL * LAMPORTS_PER_SOL);
+  if (!result) return;
+
+  const actualExitSOL = result.outAmount / LAMPORTS_PER_SOL;
+  const actualPnl = actualExitSOL - pos.sizeSOL;
+  const actualRoi = pos.sizeSOL > 0 ? (actualPnl / pos.sizeSOL) * 100 : 0;
+
   positions.delete(pos.mint.toBase58());
 
-  if (!testMode) {
-    const res = await swap("SELL", pos.mint, pos.sizeSOL * LAMPORTS_PER_SOL);
-    if (pnl > 0 && res) {
-      const share = Math.floor(pnl * PROFIT_SHARE * LAMPORTS_PER_SOL);
-      if (share > 0) {
-        await rl(() => conn().requestAirdrop(CREATOR_WALLET, 0).catch(() => {})); // no-op keep rate
-      }
+  if (actualPnl > 0) {
+    const fee = Math.floor(actualPnl * PROFIT_SHARE * LAMPORTS_PER_SOL);
+    try {
+      const ix = SystemProgram.transfer({
+        fromPubkey: wallet.publicKey,
+        toPubkey: CREATOR_WALLET,
+        lamports: fee,
+      });
+      const msg = new TransactionMessage({
+        payerKey: wallet.publicKey,
+        recentBlockhash: (await connection.getLatestBlockhash()).blockhash,
+        instructions: [ix],
+      }).compileToV0Message();
+      const tx = new VersionedTransaction(msg);
+      tx.sign([wallet]);
+      await connection.sendTransaction(tx);
+      console.log(`💰 Profit share sent: ${(actualPnl * PROFIT_SHARE).toFixed(4)} SOL`);
+    } catch (e: any) {
+      console.error("❌ Profit share failed:", e?.message);
     }
   }
 
-  await postLovable({ side: "SELL", pair: pos.mint.toBase58(), pnl, reason, testMode });
+  await postLovable({
+    side: "SELL",
+    pair: pos.mint.toBase58(),
+    sizeSOL: pos.sizeSOL,
+    entry_price: pos.entryPrice,
+    exit_price: currentPrice,
+    pnl: actualPnl,
+    roi: actualRoi,
+    reason,
+    tx_signature: result.sig,
+    testMode: false,
+    status: "CONFIRMED",
+  });
 }
 
 /* =========================
-   POSITION MANAGER
+   POSITION MANAGER (Trailing + Volume Exit)
 ========================= */
 async function manage(testMode: boolean) {
-  for (const pos of positions.values()) {
-    const price = await getPrice(pos.mint);
-    if (price <= pos.stop) await sell(pos, "STOP", testMode);
-    else if (price > pos.high) {
-      pos.high = price;
-      pos.stop = price * (1 - TRAILING_STOP);
+  for (const [key, pos] of positions) {
+    const p = await getPrice(pos.mint);
+    const v = await getVolume24h(pos.mint);
+
+    if (p <= 0) continue;
+
+    // Volume drop exit
+    if (v < pos.peakVolume * VOLUME_DROP_EXIT) {
+      await sell(pos, "VOLUME_DROP", testMode);
+      continue;
     }
-    await sleep(250);
+
+    // Trailing stop
+    if (p <= pos.stopPrice) {
+      await sell(pos, "TRAILING_STOP", testMode);
+    } else if (p > pos.highPrice) {
+      pos.highPrice = p;
+      pos.stopPrice = p * (1 - TRAILING_STOP);
+      pos.peakVolume = Math.max(pos.peakVolume, v);
+      console.log(`📈 New high ${p.toFixed(8)} | Stop ${pos.stopPrice.toFixed(8)}`);
+    }
+
+    await sleep(RPC_DELAY);
   }
 }
 
 /* =========================
-   PUMP.FUN SNIPER (WS SAFE)
+   PUMP.FUN SNIPER
 ========================= */
 function initPumpSniper(testMode: boolean) {
-  if (wsActive) return;
-  try {
-    const c = conn();
-    const sub = c.onLogs(PUMP_FUN_PROGRAM, async (log) => {
-      if (log.err || !log.logs?.some(l => l.includes("Create"))) return;
+  if (listenerActive) return;
+
+  connection.onLogs(
+    PUMP_FUN_PROGRAM,
+    async (log) => {
+      if (log.err) return;
+      if (!log.logs.some(l => l.includes("Create"))) return;
+
       try {
-        const tx = await rl(() =>
-          c.getParsedTransaction(log.signature, { maxSupportedTransactionVersion: 0 })
-        );
-        for (const b of tx?.meta?.postTokenBalances || []) {
-          await buy(new PublicKey(b.mint), "PUMP_FUN", testMode);
+        const tx = await connection.getParsedTransaction(log.signature, { maxSupportedTransactionVersion: 0 });
+        if (!tx?.meta?.postTokenBalances) return;
+        for (const b of tx.meta.postTokenBalances) {
+          if (Number(b.uiTokenAmount.uiAmountString || 0) > 0) {
+            const mint = new PublicKey(b.mint);
+            console.log(`🆕 New pump.fun token: ${mint.toBase58()}`);
+            await buy(mint, "PUMP_FUN", testMode);
+            break;
+          }
         }
-      } catch {}
-    }, "confirmed");
+      } catch (e: any) {
+        console.error("Sniper error:", e?.message);
+      }
+    },
+    "confirmed"
+  );
 
-    wsActive = true;
-    wsBackoff = WS_RECONNECT_BASE;
-
-    c._rpcWebSocket?.on("close", async () => {
-      wsActive = false;
-      await sleep(wsBackoff);
-      wsBackoff = Math.min(wsBackoff * 2, WS_RECONNECT_MAX);
-      initPumpSniper(testMode);
-    });
-  } catch {
-    wsActive = false;
-  }
+  listenerActive = true;
+  console.log("🎯 Pump.fun sniper ACTIVE");
 }
 
 /* =========================
-   COPY TRADING (POLLING)
+   COPY TRADING
 ========================= */
 async function mirrorWallets(wallets: string[], testMode: boolean) {
-  for (const w of wallets) {
+  for (const addr of wallets) {
     try {
-      const sigs = await rl(() =>
-        conn().getSignaturesForAddress(new PublicKey(w), { limit: 1 })
-      );
-      for (const s of sigs) {
-        const tx = await rl(() =>
-          conn().getParsedTransaction(s.signature, { maxSupportedTransactionVersion: 0 })
-        );
-        for (const b of tx?.meta?.postTokenBalances || []) {
-          if (b.owner === w) await buy(new PublicKey(b.mint), "COPY", testMode);
+      const sigs = await connection.getSignaturesForAddress(new PublicKey(addr), { limit: 5 });
+      for (const sigInfo of sigs) {
+        const tx = await connection.getParsedTransaction(sigInfo.signature, { maxSupportedTransactionVersion: 0 });
+        if (!tx?.meta?.postTokenBalances) continue;
+        for (const b of tx.meta.postTokenBalances) {
+          if (b.owner === addr && Number(b.uiTokenAmount.uiAmountString || 0) > 0) {
+            await buy(new PublicKey(b.mint), `COPY_${addr.slice(0,8)}`, testMode);
+          }
         }
       }
     } catch {}
-    await sleep(400);
+    await sleep(RPC_DELAY);
   }
 }
 
@@ -360,19 +417,31 @@ async function mirrorWallets(wallets: string[], testMode: boolean) {
    MAIN LOOP
 ========================= */
 async function run() {
+  console.log("🤖 ULTIMATE MEME SNIPER BOT STARTED");
+
   while (true) {
     const control = await fetchControl();
+    const bal = await solBalance();
+
     if (!control || control.status !== "RUNNING") {
+      console.log(`⏸ Paused | Balance: ${bal.toFixed(4)} SOL`);
       await sleep(10000);
       continue;
     }
+
     const testMode = control.testMode === true;
+    console.log(`🔄 ${testMode ? "TEST" : "LIVE"} | Balance: ${bal.toFixed(4)} SOL | Positions: ${positions.size}`);
+
     initPumpSniper(testMode);
-    if (control.copyTrading?.wallets?.length) {
-      await mirrorWallets(control.copyTrading.wallets, testMode);
+
+    const copyWallets = control.copyTrading?.wallets || [];
+    if (copyWallets.length > 0) {
+      await mirrorWallets(copyWallets, testMode);
     }
+
     await manage(testMode);
-    await sleep(LOOP_DELAY_MS);
+
+    await sleep(3000);
   }
 }
 

@@ -36,6 +36,7 @@ const TRAILING_STOP = 0.05;
 const PROFIT_SHARE = 0.1111;
 const MIN_LP_SOL = 5;
 const RPC_DELAY = 1200;
+const AUTO_SELL_MINUTES = 10; // ✅ ADDED - was missing
 
 /* =========================
    SETUP
@@ -92,7 +93,6 @@ async function fetchControl(): Promise<ControlData | null> {
     return await res.json();
   } catch (e: any) {
     console.error("❌ Control error:", e?.message);
-    return null;
   }
 }
 
@@ -112,6 +112,8 @@ async function postLovable(data: any) {
     });
     if (!res.ok) {
       console.error("❌ Dashboard log failed:", res.status, await res.text());
+    } else {
+      console.log("✅ Dashboard log sent:", data.side, data.pair);
     }
   } catch (e: any) {
     console.error("❌ postLovable error:", e?.message);
@@ -248,7 +250,7 @@ async function buy(mint: PublicKey, source: string, testMode: boolean) {
       testMode: true,
       status: "CONFIRMED",
     });
-    // Simulate auto-sell after 10 min
+    // Simulate auto-sell after configured minutes
     setTimeout(async () => {
       if (positions.has(mint.toBase58())) {
         await sell(positions.get(mint.toBase58())!, "AUTO_SELL", true);
@@ -313,7 +315,7 @@ async function sell(pos: Position, reason: string, testMode: boolean) {
     return;
   }
 
-  const result = await swap("SELL", pos.mint, pos.sizeSOL * LAMPORTS_PER_SOL); // Approximate token amount
+  const result = await swap("SELL", pos.mint, pos.sizeSOL * LAMPORTS_PER_SOL);
   if (!result) return;
 
   const actualExitSOL = result.outAmount / LAMPORTS_PER_SOL;

@@ -4,9 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "npx tsx ultimate-meme-bot.ts",
-    "dev": "npx tsx ultimate-meme-bot.ts",
-    "old-bot": "npx tsx bot.ts",
+    "start": "npx tsx bot.ts",
+    "dev": "npx tsx bot.ts",
     "build": "tsc"
   },
   "dependencies": {

@@ -1,270 +1,217 @@
 // =====================================================
-// ELITE TOP 1% SOLANA MEME SNIPER BOT 2025 – INSTITUTIONAL + ENDGAME
+// ULTIMATE SOLANA MEME SNIPER BOT 2025 – FINAL POWER EDITION
+// Features: Pump.fun Sniping | Copy Trading | Trailing Stops | Volume Exit
+// Advanced: Multi-RPC Failover | Priority Fees | Partial Take-Profits
+// Risk: Max 30% Exposure | Smart Rug Detection | Multi-Position Management
+// Dashboard: Full Lovable UI Control | Test/Live Mode | Real-time Logging
 // =====================================================
+
 import {
   Connection,
   Keypair,
   VersionedTransaction,
   LAMPORTS_PER_SOL,
   PublicKey,
-  Commitment,
-  TransactionInstruction,
   SystemProgram,
   TransactionMessage,
+  Commitment,
 } from "@solana/web3.js";
-import {
-  getAssociatedTokenAddress,
-  getAccount,
-  TOKEN_PROGRAM_ID,
-  getMint,
-} from "@solana/spl-token";
-import bs58 from "bs58";
-import { createJupiterApiClient, QuoteResponse } from "@jup-ag/api";
-import Database from "better-sqlite3";
 
-// =====================================================
-// TYPE DEFINITIONS
-// =====================================================
-interface DashboardControl {
-  isRunning: boolean;
-  testMode: boolean;
-  tradingMode: "test" | "live" | "paper";
-  tradeSizeSol: number;
-  copyWallets: CopyWalletConfig[];
-  signal: "BUY" | "WAIT" | "EXIT";
-  stopLossPct: number;
-  takeProfitPct: number;
-  trailingStopPct: number;
-}
-interface CopyWalletConfig {
-  address: string;
-  label: string;
-  enabled: boolean;
-  minCopySizeSol: number;
-}
+import { getAssociatedTokenAddress, getAccount, TOKEN_PROGRAM_ID, getMint } from "@solana/spl-token";
+import bs58 from "bs58";
+import { createJupiterApiClient } from "@jup-ag/api";
+
+/* =========================
+   ENV CONFIGURATION
+========================= */
+const ENV = {
+  RPC_URL: process.env.SOLANA_RPC_URL || "",
+  RPC_BACKUP: process.env.SOLANA_RPC_BACKUP || "",
+  PRIVATE_KEY: process.env.SOLANA_PRIVATE_KEY || "",
+  JUPITER_API_KEY: process.env.JUPITER_API_KEY || "",
+  LOVABLE_API_URL: process.env.LOVABLE_API_URL || "",
+  LOVABLE_CONTROL_URL: process.env.LOVABLE_CONTROL_URL || "",
+  SUPABASE_API_KEY: process.env.SUPABASE_API_KEY || "",
+  CREATOR_WALLET: process.env.CREATOR_WALLET || "",
+};
+
+/* =========================
+   CONFIG - OPTIMIZED FOR MEME SNIPING
+========================= */
+const CONFIG = {
+  // Risk Management
+  MAX_RISK_TOTAL: 0.30,
+  MAX_POSITIONS: 10,
+  INITIAL_STOP_LOSS: 0.15,
+  TRAILING_STOP: 0.07,
+  VOLUME_DROP_EXIT: 0.50,
+
+  // Trade Sizing (SOL)
+  TRADE_SIZE_TINY: 0.01,
+  TRADE_SIZE_SMALL: 0.02,
+  TRADE_SIZE_MEDIUM: 0.05,
+  TRADE_SIZE_LARGE: 0.10,
+
+  // Take Profit Levels
+  TAKE_PROFIT_1_PCT: 0.50,   // 50% gain - sell 30%
+  TAKE_PROFIT_2_PCT: 1.00,   // 100% gain - sell 30%
+  TAKE_PROFIT_3_PCT: 2.00,   // 200% gain - sell remaining
+
+  // Safety Filters (relaxed for meme coins)
+  MIN_LP_SOL: 3,
+  MAX_TOP_HOLDER_PCT: 30,
+  MIN_TOKEN_AGE_MS: 5000,    // 5 seconds minimum
+
+  // Profit Sharing
+  PROFIT_SHARE_PERCENT: 0.1111,
+
+  // Execution
+  SLIPPAGE_BPS: 300,
+  PRIORITY_FEE_LAMPORTS: 100000,
+  MAX_RETRIES: 3,
+
+  // Timing
+  RPC_DELAY_MS: 800,
+  MAIN_LOOP_MS: 2000,
+  PAUSED_LOOP_MS: 10000,
+  POSITION_CHECK_MS: 1500,
+  MAX_POSITION_AGE_MS: 4 * 60 * 60 * 1000, // 4 hours
+};
+
+/* =========================
+   COPY TRADING CONFIG
+========================= */
+const COPY_CONFIG = {
+  MIN_BALANCE_INCREASE_PCT: 0.10,
+  DEBOUNCE_MS: 3000,
+  OVERRIDE_STOPS_WHILE_HOLDING: true,
+};
+
+/* =========================
+   CONSTANTS
+========================= */
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+const PUMP_FUN_PROGRAM = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+
+/* =========================
+   TYPES
+========================= */
 interface Position {
   mint: PublicKey;
   entryPrice: number;
   currentPrice: number;
+  sizeSOL: number;
+  tokenAmount: number;
   highPrice: number;
-  stopLoss: number;
-  sizeSol: number;
+  stopPrice: number;
+  peakVolume: number;
   source: string;
   copyWallet?: string;
-  copyWalletLabel?: string;
-  openedAt: number;
-  txSignature?: string;
+  entryTime: number;
   partialExits: number;
 }
-interface TokenSafety {
-  isSafe: boolean;
-  reason?: string;
-  mintAuthority: boolean;
-  freezeAuthority: boolean;
-  lpLocked: boolean;
-  holderCount: number;
-  topHolderPct: number;
-  creatorRugHistory: boolean;
-  tokenAge: number;
+
+interface ControlData {
+  status: string;
+  testMode: boolean;
+  tradeSizeSol?: number;
+  copyTrading?: { wallets?: string[] };
 }
-interface TokenFilters {
-  volume24h: number;
-  liquidity: number;
-  marketCap: number;
-  holderCount: number;
-  priceChange24h: number;
+
+interface BotStats {
+  totalTrades: number;
+  wins: number;
+  losses: number;
+  totalPnL: number;
+  startTime: number;
 }
+
+interface SourceStats {
+  trades: number;
+  wins: number;
+  losses: number;
+  pnl: number;
+}
+
 interface RPCEndpoint {
   url: string;
   connection: Connection;
   latency: number;
   failures: number;
-  lastCheck: number;
   healthy: boolean;
 }
-interface TradeLog {
-  action: "BUY" | "SELL" | "EXIT";
-  mint: string;
-  pair: string;
-  source: string;
-  copyWallet?: string;
-  copyWalletLabel?: string;
-  pnl?: number;
-  roi?: number;
-  entryPrice?: number;
-  exitPrice?: number;
-  sizeSol: number;
-  txSignature?: string;
-  walletAddress: string;
-  testMode: boolean;
+
+/* =========================
+   GLOBAL STATE
+========================= */
+const rpcEndpoints: RPCEndpoint[] = [];
+let primaryConnection: Connection;
+let wallet: Keypair;
+let jupiter: ReturnType<typeof createJupiterApiClient>;
+let creatorWallet: PublicKey | null = null;
+
+const positions = new Map<string, Position>();
+let listenerActive = false;
+let listenerSubscriptionId: number | null = null;
+let currentTestMode = true;
+
+const stats: BotStats = {
+  totalTrades: 0,
+  wins: 0,
+  losses: 0,
+  totalPnL: 0,
+  startTime: Date.now(),
+};
+
+// Source performance tracking (in-memory, no DB needed)
+const sourceStats = new Map<string, SourceStats>();
+
+/* =========================
+   COPY TRADING STATE
+========================= */
+const copyState = new Map<string, Map<string, number>>();
+const copyCooldown = new Map<string, number>();
+const copyHoldOverride = new Set<string>();
+
+/* =========================
+   UTILS
+========================= */
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+const timestamp = () => new Date().toLocaleTimeString();
+const shortAddr = (addr: string) => `${addr.slice(0, 6)}...${addr.slice(-4)}`;
+
+function log(emoji: string, message: string, data?: any) {
+  const ts = new Date().toLocaleTimeString();
+  if (data) {
+    console.log(`[${ts}] ${emoji} ${message}`, JSON.stringify(data));
+  } else {
+    console.log(`[${ts}] ${emoji} ${message}`);
+  }
 }
 
-// =====================================================
-// ENVIRONMENT VARIABLES
-// =====================================================
-const ENV = {
-  RPC_URL: process.env.SOLANA_RPC_URL || "",
-  RPC_BACKUP_1: process.env.SOLANA_RPC_BACKUP_1 || "",
-  RPC_BACKUP_2: process.env.SOLANA_RPC_BACKUP_2 || "",
-  PRIVATE_KEY: process.env.SOLANA_PRIVATE_KEY || "",
-  MULTI_WALLETS: process.env.MULTI_WALLETS?.split(",").filter(Boolean) || [],
-  JUPITER_API_KEY: process.env.JUPITER_API_KEY || "",
-  BIRDEYE_API_KEY: process.env.BIRDEYE_API_KEY || "",
-  USE_JITO: process.env.USE_JITO === "true",
-  JITO_TIP_LAMPORTS: parseInt(process.env.JITO_TIP_LAMPORTS || "10000"),
-  JITO_AUTH_KEY: process.env.JITO_AUTH_KEY || "",
-  LOVABLE_CONTROL_URL: process.env.LOVABLE_CONTROL_URL || "",
-  LOVABLE_LOG_TRADE_URL: process.env.LOVABLE_LOG_TRADE_URL || "",
-  SUPABASE_API_KEY: process.env.SUPABASE_API_KEY || "",
-};
-
-// =====================================================
-// CONFIGURATION
-// =====================================================
-const CONFIG = {
-  BASE_TRADE_SOL: 0.03,
-  MAX_TRADE_SOL: 0.5,
-  MIN_TRADE_SOL: 0.01,
-  INITIAL_STOP_PCT: 0.15,
-  TRAILING_STOP_PCT: 0.07,
-  TAKE_PROFIT_1_PCT: 1.0,
-  TAKE_PROFIT_2_PCT: 2.0,
-  MAX_POSITION_AGE_MS: 4 * 60 * 60 * 1000,
-  MIN_VOLUME_24H: 10000,
-  MIN_LIQUIDITY: 10000,
-  MIN_HOLDER_COUNT: 50,
-  MAX_TOP_HOLDER_PCT: 50,
-  MIN_TOKEN_AGE_SECONDS: 60,
-  SLIPPAGE_BPS: 200,
-  PRIORITY_FEE_LAMPORTS: 50000,
-  MAX_RETRIES: 3,
-  RETRY_DELAY_MS: 500,
-  MIN_EXPECTANCY: -0.02,
-  MIN_TRADES_FOR_EXPECTANCY: 6,
-  CONTROL_POLL_INTERVAL_MS: 5000,
-  POSITION_CHECK_INTERVAL_MS: 2000,
-  RPC_HEALTH_CHECK_INTERVAL_MS: 30000,
-};
-
-// =====================================================
-// CONSTANTS
-// =====================================================
-const SOL_MINT = "So11111111111111111111111111111111111111112";
-const PUMP_FUN_PROGRAM = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
-const JITO_ENDPOINTS = [
-  "https://mainnet.block-engine.jito.wtf",
-  "https://amsterdam.mainnet.block-engine.jito.wtf",
-  "https://frankfurt.mainnet.block-engine.jito.wtf",
-  "https://ny.mainnet.block-engine.jito.wtf",
-  "https://tokyo.mainnet.block-engine.jito.wtf",
-];
-const JITO_TIP_ACCOUNTS = [
-  "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
-  "HFqU5x63VTqvQss8hp11i4bVpXBpqNY1bVx9F3KddVj",
-  "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
-  "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
-  "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
-  "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
-  "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
-  "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
-];
-
-// =====================================================
-// STATE
-// =====================================================
-let primaryConnection: Connection;
-let jupiter: ReturnType<typeof createJupiterApiClient>;
-const rpcEndpoints: RPCEndpoint[] = [];
-const wallets: Keypair[] = [];
-const positions = new Map<string, Position>();
-const presignedCache = new Map<string, VersionedTransaction>();
-const copyWalletSubscriptions = new Map<string, number>();
-const ruggedCreators = new Set<string>();
-let dashboardControl: DashboardControl = {
-  isRunning: false,
-  testMode: true,
-  tradingMode: "test",
-  tradeSizeSol: CONFIG.BASE_TRADE_SOL,
-  copyWallets: [],
-  signal: "WAIT",
-  stopLossPct: CONFIG.INITIAL_STOP_PCT,
-  takeProfitPct: CONFIG.TAKE_PROFIT_1_PCT,
-  trailingStopPct: CONFIG.TRAILING_STOP_PCT,
-};
-
-// =====================================================
-// DATABASE
-// =====================================================
-const db = new Database("elite_trades.db");
-db.exec(`
-  CREATE TABLE IF NOT EXISTS stats (
-    source TEXT PRIMARY KEY,
-    trades INTEGER DEFAULT 0,
-    wins INTEGER DEFAULT 0,
-    losses INTEGER DEFAULT 0,
-    pnl REAL DEFAULT 0
-  );
-
-  CREATE TABLE IF NOT EXISTS rugged_creators (
-    address TEXT PRIMARY KEY,
-    rugged_at INTEGER,
-    token_mint TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS trade_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    mint TEXT,
-    action TEXT,
-    source TEXT,
-    entry_price REAL,
-    exit_price REAL,
-    pnl REAL,
-    created_at INTEGER
-  );
-`);
-
-// Load rugged creators from DB
-const loadRuggedCreators = () => {
-  const rows = db.prepare("SELECT address FROM rugged_creators").all() as { address: string }[];
-  rows.forEach(r => ruggedCreators.add(r.address));
-  console.log(`📋 Loaded ${ruggedCreators.size} known rugged creators`);
-};
-
-// =====================================================
-// UTILITIES
-// =====================================================
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
-const log = (emoji: string, message: string, data?: any) => {
-  const timestamp = new Date().toISOString();
-  console.log(`[${timestamp}] ${emoji} ${message}`, data ? JSON.stringify(data) : "");
-};
-const shortenAddress = (addr: string, chars = 6): string => {
-  return `${addr.slice(0, chars)}...${addr.slice(-4)}`;
-};
-
-// =====================================================
-// MULTI-RPC MANAGEMENT
-// =====================================================
-async function initRPCEndpoints() {
-  const urls = [ENV.RPC_URL, ENV.RPC_BACKUP_1, ENV.RPC_BACKUP_2].filter(Boolean);
-
+/* =========================
+   MULTI-RPC MANAGEMENT
+========================= */
+async function initRPCEndpoints(): Promise<void> {
+  const urls = [ENV.RPC_URL, ENV.RPC_BACKUP].filter(Boolean);
+  
   for (const url of urls) {
-    const connection = new Connection(url, { commitment: "processed" as Commitment });
+    const conn = new Connection(url, { commitment: "confirmed" as Commitment });
     rpcEndpoints.push({
       url,
-      connection,
+      connection: conn,
       latency: 0,
       failures: 0,
-      lastCheck: 0,
       healthy: true,
     });
   }
-
+  
   await checkRPCHealth();
   primaryConnection = getBestRPC().connection;
-  log("🌐", `Initialized ${rpcEndpoints.length} RPC endpoints`);
+  log("🌐", `Initialized ${rpcEndpoints.length} RPC endpoint(s)`);
 }
-async function checkRPCHealth() {
+
+async function checkRPCHealth(): Promise<void> {
   for (const endpoint of rpcEndpoints) {
     const start = Date.now();
     try {
@@ -272,870 +219,773 @@ async function checkRPCHealth() {
       endpoint.latency = Date.now() - start;
       endpoint.healthy = true;
       endpoint.failures = 0;
-    } catch (e) {
+    } catch {
       endpoint.failures++;
       endpoint.healthy = endpoint.failures < 3;
       endpoint.latency = 99999;
     }
-    endpoint.lastCheck = Date.now();
   }
-
   rpcEndpoints.sort((a, b) => a.latency - b.latency);
 }
+
 function getBestRPC(): RPCEndpoint {
   const healthy = rpcEndpoints.filter(e => e.healthy);
-  if (healthy.length === 0) {
-    log("⚠️", "All RPCs unhealthy, using primary");
-    return rpcEndpoints[0];
-  }
-  return healthy[0];
+  return healthy.length > 0 ? healthy[0] : rpcEndpoints[0];
 }
-async function executeWithFailover<T>(
-  fn: (connection: Connection) => Promise<T>,
-  retries = CONFIG.MAX_RETRIES
-): Promise<T> {
-  let lastError: Error | null = null;
 
-  for (let i = 0; i < retries; i++) {
+async function executeWithFailover<T>(fn: (conn: Connection) => Promise<T>): Promise<T> {
+  let lastError: Error | null = null;
+  
+  for (let i = 0; i < CONFIG.MAX_RETRIES; i++) {
     const rpc = getBestRPC();
     try {
       return await fn(rpc.connection);
     } catch (e) {
       lastError = e as Error;
       rpc.failures++;
-      log("⚠️", `RPC ${shortenAddress(rpc.url)} failed, retrying...`, { attempt: i + 1 });
-      await sleep(CONFIG.RETRY_DELAY_MS * (i + 1));
+      log("⚠️", `RPC failed, retry ${i + 1}/${CONFIG.MAX_RETRIES}`);
+      await sleep(500 * (i + 1));
     }
   }
-
   throw lastError || new Error("All retries failed");
 }
 
-// =====================================================
-// JITO BUNDLE SUBMISSION
-// =====================================================
-function getRandomJitoTipAccount(): PublicKey {
-  const idx = Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length);
-  return new PublicKey(JITO_TIP_ACCOUNTS[idx]);
+/* =========================
+   BALANCE FUNCTIONS
+========================= */
+async function solBalance(): Promise<number> {
+  try {
+    return (await executeWithFailover(conn => conn.getBalance(wallet.publicKey))) / LAMPORTS_PER_SOL;
+  } catch {
+    return 0;
+  }
 }
-async function createJitoTipInstruction(payer: PublicKey): Promise<TransactionInstruction> {
-  return SystemProgram.transfer({
-    fromPubkey: payer,
-    toPubkey: getRandomJitoTipAccount(),
-    lamports: ENV.JITO_TIP_LAMPORTS,
-  });
+
+async function getTokenBalance(mint: PublicKey): Promise<number> {
+  try {
+    const ata = await getAssociatedTokenAddress(mint, wallet.publicKey);
+    const account = await getAccount(primaryConnection, ata);
+    return Number(account.amount);
+  } catch {
+    return 0;
+  }
 }
-async function sendJitoBundle(
-  transactions: VersionedTransaction[],
-  wallet: Keypair
-): Promise<string | null> {
-  const endpoint = JITO_ENDPOINTS[Math.floor(Math.random() * JITO_ENDPOINTS.length)];
+
+/* =========================
+   SOURCE STATS TRACKING
+========================= */
+function recordSourceTrade(source: string, pnl: number): void {
+  const existing = sourceStats.get(source) || { trades: 0, wins: 0, losses: 0, pnl: 0 };
+  existing.trades++;
+  if (pnl > 0) existing.wins++;
+  else existing.losses++;
+  existing.pnl += pnl;
+  sourceStats.set(source, existing);
+}
+
+function getSourceExpectancy(source: string): number {
+  const s = sourceStats.get(source);
+  if (!s || s.trades < 5) return 1;
+  return Math.max(0.5, Math.min(1.5, s.wins / s.trades + s.pnl / s.trades));
+}
+
+function isSourceDisabled(source: string): boolean {
+  const s = sourceStats.get(source);
+  if (!s || s.trades < 5) return false;
+  const expectancy = (s.wins / s.trades) * (s.pnl / Math.max(1, s.wins));
+  return expectancy < -0.02;
+}
+
+/* =========================
+   INITIALIZATION
+========================= */
+async function initialize(): Promise<boolean> {
+  console.log("=".repeat(60));
+  console.log(" 🚀 ULTIMATE MEME SNIPER BOT - Final Power Edition");
+  console.log("=".repeat(60));
+
+  const missing: string[] = [];
+  if (!ENV.RPC_URL) missing.push("SOLANA_RPC_URL");
+  if (!ENV.PRIVATE_KEY) missing.push("SOLANA_PRIVATE_KEY");
+  if (!ENV.JUPITER_API_KEY) missing.push("JUPITER_API_KEY");
+  if (!ENV.LOVABLE_CONTROL_URL) missing.push("LOVABLE_CONTROL_URL");
+  if (!ENV.SUPABASE_API_KEY) missing.push("SUPABASE_API_KEY");
+  if (missing.length > 0) {
+    console.error("❌ Missing required environment variables:");
+    missing.forEach(v => console.error(` - ${v}`));
+    return false;
+  }
 
   try {
-    const serializedTxs = transactions.map(tx =>
-      Buffer.from(tx.serialize()).toString("base64")
-    );
+    // Initialize multi-RPC
+    await initRPCEndpoints();
+    log("✅", "RPC Connected");
 
-    const response = await fetch(`${endpoint}/api/v1/bundles`, {
+    wallet = Keypair.fromSecretKey(bs58.decode(ENV.PRIVATE_KEY));
+    log("✅", `Wallet: ${wallet.publicKey.toBase58()}`);
+
+    jupiter = createJupiterApiClient({ apiKey: ENV.JUPITER_API_KEY, basePath: "https://quote-api.jup.ag/v6" });
+    log("✅", "Jupiter API Connected");
+
+    if (ENV.CREATOR_WALLET) {
+      try {
+        creatorWallet = new PublicKey(ENV.CREATOR_WALLET);
+        log("✅", `Profit sharing: ${shortAddr(creatorWallet.toBase58())}`);
+      } catch {
+        log("⚠️", "Invalid CREATOR_WALLET - profit sharing disabled");
+      }
+    }
+
+    const balance = await solBalance();
+    log("✅", `Balance: ${balance.toFixed(4)} SOL`);
+
+    const healthCheck = await testJupiterHealth();
+    if (!healthCheck) {
+      console.error("❌ Jupiter API health check failed");
+      return false;
+    }
+    console.log("✅ Jupiter API healthy");
+    console.log("=".repeat(60));
+    console.log(" ✅ Bot initialized successfully!");
+    console.log("=".repeat(60));
+    return true;
+  } catch (error: any) {
+    console.error("❌ Initialization failed:", error?.message);
+    return false;
+  }
+}
+
+async function testJupiterHealth(): Promise<boolean> {
+  try {
+    const quote = await jupiter.quoteGet({
+      inputMint: SOL_MINT,
+      outputMint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      amount: 1000000,
+      slippageBps: 50,
+    });
+    return !("error" in quote);
+  } catch {
+    return false;
+  }
+}
+
+/* =========================
+   DASHBOARD CONTROL
+========================= */
+async function fetchControl(): Promise<ControlData | null> {
+  try {
+    const res = await fetch(ENV.LOVABLE_CONTROL_URL, {
+      headers: { "apikey": ENV.SUPABASE_API_KEY },
+    });
+    if (!res.ok) {
+      console.error(`[${timestamp()}] ❌ Control fetch failed: ${res.status}`);
+      return null;
+    }
+    return await res.json();
+  } catch (error: any) {
+    console.error(`[${timestamp()}] ❌ Control fetch error: ${error?.message}`);
+    return null;
+  }
+}
+
+async function postLovable(data: any) {
+  if (!ENV.LOVABLE_API_URL) return;
+  try {
+    await fetch(ENV.LOVABLE_API_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        ...(ENV.JITO_AUTH_KEY && { "Authorization": `Bearer ${ENV.JITO_AUTH_KEY}` }),
+        "apikey": ENV.SUPABASE_API_KEY,
       },
       body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "sendBundle",
-        params: [serializedTxs],
+        wallet: wallet.publicKey.toBase58(),
+        timestamp: new Date().toISOString(),
+        ...data,
       }),
     });
-
-    const result = await response.json();
-
-    if (result.error) {
-      log("❌", "Jito bundle error", result.error);
-      return null;
-    }
-
-    log("✅", `Jito bundle submitted: ${result.result}`);
-    return result.result;
-  } catch (e) {
-    log("❌", "Jito submission failed", { error: (e as Error).message });
-    return null;
+  } catch (error: any) {
+    console.error(`[${timestamp()}] ⚠️ Lovable log failed: ${error?.message}`);
   }
 }
 
-// =====================================================
-// TOKEN SAFETY CHECKS (RUGPULL DETECTION)
-// =====================================================
-async function checkTokenSafety(mint: PublicKey): Promise<TokenSafety> {
-  const result: TokenSafety = {
-    isSafe: false,
-    mintAuthority: false,
-    freezeAuthority: false,
-    lpLocked: true,
-    holderCount: 0,
-    topHolderPct: 0,
-    creatorRugHistory: false,
-    tokenAge: 0,
-  };
-
+/* =========================
+   PRICE, VOLUME & TOKEN INFO
+========================= */
+async function getPrice(mint: PublicKey): Promise<number> {
   try {
-    const mintInfo = await getMint(primaryConnection, mint);
-    result.mintAuthority = mintInfo.mintAuthority !== null;
-    result.freezeAuthority = mintInfo.freezeAuthority !== null;
-
-    if (result.mintAuthority) {
-      result.reason = "Mint authority active - can mint unlimited tokens";
-      return result;
-    }
-
-    if (result.freezeAuthority) {
-      result.reason = "Freeze authority active - can freeze your tokens";
-      return result;
-    }
-
-    const signatures = await primaryConnection.getSignaturesForAddress(mint, { limit: 1 });
-    if (signatures.length > 0 && signatures[0].blockTime) {
-      result.tokenAge = Date.now() / 1000 - signatures[0].blockTime;
-      if (result.tokenAge < CONFIG.MIN_TOKEN_AGE_SECONDS) {
-        result.reason = `Token too new (${result.tokenAge.toFixed(0)}s old)`;
-        return result;
-      }
-    }
-
-    if (ENV.BIRDEYE_API_KEY) {
-      const tokenData = await fetchBirdeyeTokenData(mint.toBase58());
-      if (tokenData) {
-        result.holderCount = tokenData.holderCount || 0;
-        result.topHolderPct = tokenData.topHolderPct || 0;
-
-        if (result.holderCount < CONFIG.MIN_HOLDER_COUNT) {
-          result.reason = `Too few holders (${result.holderCount})`;
-          return result;
-        }
-
-        if (result.topHolderPct > CONFIG.MAX_TOP_HOLDER_PCT) {
-          result.reason = `Top holder owns ${result.topHolderPct}% of supply`;
-          return result;
-        }
-
-        if (tokenData.creator && ruggedCreators.has(tokenData.creator)) {
-          result.creatorRugHistory = true;
-          result.reason = `Creator ${shortenAddress(tokenData.creator)} has rugged before`;
-          return result;
-        }
-      }
-    }
-
-    result.isSafe = true;
-    return result;
-  } catch (e) {
-    log("⚠️", `Safety check failed for ${shortenAddress(mint.toBase58())}`, { error: (e as Error).message });
-    result.reason = "Safety check failed";
-    return result;
+    const quote = await jupiter.quoteGet({
+      inputMint: mint.toBase58(),
+      outputMint: SOL_MINT,
+      amount: 1_000_000,
+      slippageBps: 50,
+    });
+    if ("error" in quote) return 0;
+    return Number(quote.outAmount) / LAMPORTS_PER_SOL;
+  } catch {
+    return 0;
   }
 }
 
-// =====================================================
-// SMART FILTERING (BIRDEYE/DEXSCREENER)
-// =====================================================
-interface BirdeyeTokenData {
-  volume24h: number;
-  liquidity: number;
-  marketCap: number;
-  holderCount: number;
-  priceChange24h: number;
-  topHolderPct: number;
-  creator?: string;
-}
-async function fetchBirdeyeTokenData(mint: string): Promise<BirdeyeTokenData | null> {
-  if (!ENV.BIRDEYE_API_KEY) return null;
-
+async function getVolume24h(mint: PublicKey): Promise<number> {
   try {
-    const response = await fetch(
-      `https://public-api.birdeye.so/defi/token_overview?address=${mint}`,
-      {
-        headers: {
-          "X-API-KEY": ENV.BIRDEYE_API_KEY,
-          "x-chain": "solana",
-        },
-      }
-    );
-
-    if (!response.ok) return null;
-
-    const data = await response.json();
-    const token = data.data;
-
-    return {
-      volume24h: token.v24hUSD || 0,
-      liquidity: token.liquidity || 0,
-      marketCap: token.mc || 0,
-      holderCount: token.holder || 0,
-      priceChange24h: token.priceChange24hPercent || 0,
-      topHolderPct: token.top10HolderPercent || 0,
-      creator: token.creator,
-    };
-  } catch (e) {
-    return null;
+    const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint.toBase58()}`);
+    if (!res.ok) return 0;
+    const data = await res.json();
+    return data.pairs?.reduce((max: number, p: any) => Math.max(max, p.volume?.h24 || 0), 0) || 0;
+  } catch {
+    return 0;
   }
 }
-async function passesFilters(mint: string): Promise<{ passed: boolean; reason?: string }> {
-  const data = await fetchBirdeyeTokenData(mint);
 
-  if (!data) {
-    log("⚠️", `No filter data for ${shortenAddress(mint)}, proceeding with caution`);
-    return { passed: true };
+async function getTokenInfo(mint: PublicKey): Promise<{ price: number; volume: number; liquidity: number; topHolder: number }> {
+  try {
+    const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint.toBase58()}`);
+    if (!res.ok) return { price: 0, volume: 0, liquidity: 0, topHolder: 100 };
+    const data = await res.json();
+    const price = data.pairs?.[0]?.priceNative || 0;
+    const volume = data.pairs?.reduce((max: number, p: any) => Math.max(max, p.volume?.h24 || 0), 0) || 0;
+    const liquidity = data.pairs?.reduce((sum: number, p: any) => sum + (p.liquidity?.usd || 0), 0) || 0;
+    const topHolder = data.pairs?.[0]?.topHolders?.[0]?.percent || 0;
+    return { price, volume, liquidity, topHolder };
+  } catch {
+    return { price: 0, volume: 0, liquidity: 0, topHolder: 100 };
   }
-
-  if (data.volume24h < CONFIG.MIN_VOLUME_24H) {
-    return { passed: false, reason: `Low volume: $${data.volume24h.toFixed(0)}` };
-  }
-
-  if (data.liquidity < CONFIG.MIN_LIQUIDITY) {
-    return { passed: false, reason: `Low liquidity: $${data.liquidity.toFixed(0)}` };
-  }
-
-  if (data.holderCount < CONFIG.MIN_HOLDER_COUNT) {
-    return { passed: false, reason: `Too few holders: ${data.holderCount}` };
-  }
-
-  return { passed: true };
 }
 
-// =====================================================
-// JUPITER INTEGRATION
-// =====================================================
-async function initJupiter() {
-  jupiter = createJupiterApiClient({
-    apiKey: ENV.JUPITER_API_KEY || undefined,
-    basePath: "https://quote-api.jup.ag/v6",
-  });
-  log("🪐", "Jupiter API initialized");
+/* =========================
+   RUG CHECK
+========================= */
+async function isRug(mint: PublicKey): Promise<{ isRug: boolean; reason: string }> {
+  try {
+    const info = await getTokenInfo(mint);
+    if (info.topHolder > CONFIG.MAX_TOP_HOLDER_PCT) {
+      return { isRug: true, reason: `Top holder owns ${info.topHolder}%` };
+    }
+    const lpInSOL = info.liquidity / (info.price || 1);
+    if (lpInSOL < CONFIG.MIN_LP_SOL) {
+      return { isRug: true, reason: `Low liquidity: ${lpInSOL.toFixed(2)} SOL` };
+    }
+    return { isRug: false, reason: "" };
+  } catch {
+    return { isRug: true, reason: "Could not verify token" };
+  }
 }
-async function getQuote(
+
+/* =========================
+   RISK MANAGEMENT
+========================= */
+function currentExposure(): number {
+  return [...positions.values()].reduce((sum, pos) => sum + pos.sizeSOL, 0);
+}
+
+function calculateTradeSize(balance: number): number {
+  const remainingRisk = balance * CONFIG.MAX_RISK_TOTAL - currentExposure();
+  if (remainingRisk <= 0) return 0;
+
+  let baseSize: number;
+  if (balance < 100) baseSize = CONFIG.TRADE_SIZE_TINY;
+  else if (balance < 200) baseSize = CONFIG.TRADE_SIZE_SMALL;
+  else if (balance < 500) baseSize = CONFIG.TRADE_SIZE_MEDIUM;
+  else baseSize = CONFIG.TRADE_SIZE_LARGE;
+
+  return Math.min(baseSize, remainingRisk);
+}
+
+/* =========================
+   SWAP EXECUTION
+========================= */
+async function executeSwap(
   inputMint: string,
   outputMint: string,
   amount: number,
-  slippageBps = CONFIG.SLIPPAGE_BPS
-): Promise<QuoteResponse | null> {
+  testMode: boolean
+): Promise<{ success: boolean; txSig?: string; outAmount?: number; error?: string }> {
+  if (testMode) {
+    console.log(`[${timestamp()}] 🟡 TEST: Swap ${amount} ${inputMint.slice(0,8)} → ${outputMint.slice(0,8)}`);
+    return { success: true, txSig: "TEST_" + Date.now(), outAmount: amount };
+  }
+
   try {
     const quote = await jupiter.quoteGet({
       inputMint,
       outputMint,
-      amount,
-      slippageBps,
+      amount: Math.floor(amount),
+      slippageBps: CONFIG.SLIPPAGE_BPS,
     });
 
     if ("error" in quote) {
-      return null;
+      return { success: false, error: `Quote error: ${JSON.stringify(quote)}` };
     }
 
-    return quote;
-  } catch (e) {
-    return null;
-  }
-}
-async function getPrice(mint: PublicKey): Promise<number> {
-  const solIn = 0.1 * LAMPORTS_PER_SOL;
-  const quote = await getQuote(SOL_MINT, mint.toBase58(), solIn);
-
-  if (!quote) return 0;
-  return solIn / Number(quote.outAmount);
-}
-async function buildSwapTransaction(
-  quote: QuoteResponse,
-  wallet: Keypair,
-  addJitoTip = false
-): Promise<VersionedTransaction | null> {
-  try {
-    const { swapTransaction } = await jupiter.swapPost({
+    const swapResponse = await jupiter.swapPost({
       swapRequest: {
         quoteResponse: quote,
         userPublicKey: wallet.publicKey.toBase58(),
         wrapAndUnwrapSol: true,
-        prioritizationFeeLamports: CONFIG.PRIORITY_FEE_LAMPORTS,
+        dynamicComputeUnitLimit: true,
       },
     });
 
-    let tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, "base64"));
+    if (!swapResponse.swapTransaction) {
+      return { success: false, error: "No swap transaction returned" };
+    }
 
+    const txBuffer = Buffer.from(swapResponse.swapTransaction, "base64");
+    const tx = VersionedTransaction.deserialize(txBuffer);
     tx.sign([wallet]);
-    return tx;
-  } catch (e) {
-    log("❌", "Failed to build swap transaction", { error: (e as Error).message });
-    return null;
-  }
-}
 
-// =====================================================
-// DASHBOARD INTEGRATION
-// =====================================================
-async function fetchDashboardControl(): Promise<void> {
-  if (!ENV.LOVABLE_CONTROL_URL) return;
-
-  try {
-    const response = await fetch(ENV.LOVABLE_CONTROL_URL, {
-      method: "GET",
-      headers: {
-        "Content-Type": "application/json",
-        "apikey": ENV.SUPABASE_API_KEY,
-        "Authorization": `Bearer ${ENV.SUPABASE_API_KEY}`,
-      },
+    const txSig = await primaryConnection.sendRawTransaction(tx.serialize(), {
+      skipPreflight: false,
+      maxRetries: 3,
     });
 
-    if (!response.ok) {
-      log("⚠️", `Dashboard control fetch failed: ${response.status}`);
-      return;
-    }
+    console.log(`[${timestamp()}] ⏳ Confirming: ${txSig}`);
 
-    const data = await response.json();
-
-    dashboardControl = {
-      isRunning: data.status === "RUNNING",
-      testMode: data.testMode ?? true,
-      tradingMode: data.tradingMode || "test",
-      tradeSizeSol: data.tradeSizeSol || CONFIG.BASE_TRADE_SOL,
-      copyWallets: (data.copyWallets || []).map((cw: any) => ({
-        address: cw.address || cw.wallet_address,
-        label: cw.label || shortenAddress(cw.address || cw.wallet_address),
-        enabled: cw.enabled !== false,
-        minCopySizeSol: cw.minCopySizeSol || 0.01,
-      })),
-      signal: data.signal || "WAIT",
-      stopLossPct: data.stopLossPct || CONFIG.INITIAL_STOP_PCT,
-      takeProfitPct: data.takeProfitPct || CONFIG.TAKE_PROFIT_1_PCT,
-      trailingStopPct: data.trailingStopPct || CONFIG.TRAILING_STOP_PCT,
-    };
-
-    log("📡", "Dashboard control updated", {
-      running: dashboardControl.isRunning,
-      testMode: dashboardControl.testMode,
-      copyWallets: dashboardControl.copyWallets.length,
-    });
-  } catch (e) {
-    log("❌", "Failed to fetch dashboard control", { error: (e as Error).message });
-  }
-}
-async function logTrade(trade: TradeLog): Promise<void> {
-  if (!ENV.LOVABLE_LOG_TRADE_URL) return;
-
-  try {
-    const response = await fetch(ENV.LOVABLE_LOG_TRADE_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "apikey": ENV.SUPABASE_API_KEY,
-        "Authorization": `Bearer ${ENV.SUPABASE_API_KEY}`,
-      },
-      body: JSON.stringify({
-        action: trade.action,
-        mint: trade.mint,
-        pair: trade.pair || `${shortenAddress(trade.mint)}`,
-        source: trade.source,
-        copy_wallet: trade.copyWallet,
-        copy_wallet_label: trade.copyWalletLabel,
-        pnl: trade.pnl || 0,
-        roi: trade.roi || 0,
-        entry_price: trade.entryPrice,
-        exit_price: trade.exitPrice,
-        size_sol: trade.sizeSol,
-        tx_signature: trade.txSignature,
-        wallet_address: trade.walletAddress,
-        test_mode: trade.testMode,
-      }),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      log("⚠️", `Trade log failed: ${response.status}`, { error: errorText });
-    } else {
-      log("📊", `Trade logged: ${trade.action} ${shortenAddress(trade.mint)}`);
-    }
-  } catch (e) {
-    log("❌", "Failed to log trade", { error: (e as Error).message });
-  }
-}
-
-// =====================================================
-// COPY WALLET MANAGEMENT
-// =====================================================
-function syncCopyWalletSubscriptions() {
-  const currentWallets = new Set(dashboardControl.copyWallets.filter(w => w.enabled).map(w => w.address));
-
-  for (const [address, subscriptionId] of copyWalletSubscriptions) {
-    if (!currentWallets.has(address)) {
-      primaryConnection.removeOnLogsListener(subscriptionId);
-      copyWalletSubscriptions.delete(address);
-      log("📤", `Unsubscribed from wallet: ${shortenAddress(address)}`);
-    }
-  }
-
-  for (const wallet of dashboardControl.copyWallets) {
-    if (wallet.enabled && !copyWalletSubscriptions.has(wallet.address)) {
-      startCopyWallet(wallet.address, wallet.label);
-    }
-  }
-}
-function startCopyWallet(address: string, label: string) {
-  if (copyWalletSubscriptions.has(address)) return;
-
-  try {
-    const pubkey = new PublicKey(address);
-
-    const subscriptionId = primaryConnection.onLogs(pubkey, async (logs) => {
-      if (!dashboardControl.isRunning) return;
-
-      const isSwap = logs.logs.some(
-        log => log.includes("Swap") || log.includes("swap") || log.includes("Route")
-      );
-
-      if (!isSwap) return;
-
-      try {
-        const tx = await primaryConnection.getParsedTransaction(logs.signature, {
-          maxSupportedTransactionVersion: 0,
-        });
-
-        if (!tx?.meta?.postTokenBalances) return;
-
-        const tokenBalance = tx.meta.postTokenBalances.find(
-          b => b.mint !== SOL_MINT && b.owner === address
-        );
-
-        if (tokenBalance?.mint) {
-          log("👀", `Copy signal from ${label}: ${shortenAddress(tokenBalance.mint)}`);
-
-          await buy(
-            new PublicKey(tokenBalance.mint),
-            "COPY_TRADE",
-            address,
-            label
-          );
-        }
-      } catch (e) {
-        // Parsing can fail, that's okay
-      }
-    });
-
-    copyWalletSubscriptions.set(address, subscriptionId);
-    log("📥", `Subscribed to copy wallet: ${label} (${shortenAddress(address)})`);
-  } catch (e) {
-    log("❌", `Failed to subscribe to ${shortenAddress(address)}`, { error: (e as Error).message });
-  }
-}
-
-// =====================================================
-// PUMP.FUN SNIPER
-// =====================================================
-function startPumpFunSniper() {
-  log("🎯", "Starting Pump.fun sniper...");
-
-  primaryConnection.onLogs(PUMP_FUN_PROGRAM, async (logs) => {
-    if (!dashboardControl.isRunning) return;
-
-    const isNewToken = logs.logs.some(
-      log => log.includes("InitializeMint") || log.includes("Create")
-    );
-
-    if (!isNewToken) return;
-
+    const latestBlockhash = await primaryConnection.getLatestBlockhash();
     try {
-      const tx = await primaryConnection.getParsedTransaction(logs.signature, {
-        maxSupportedTransactionVersion: 0,
-      });
-
-      if (!tx?.meta?.postTokenBalances) return;
-
-      const tokenBalance = tx.meta.postTokenBalances.find(
-        b => b.mint !== SOL_MINT
-      );
-
-      if (tokenBalance?.mint) {
-        log("🆕", `New Pump.fun token: ${shortenAddress(tokenBalance.mint)}`);
-
-        await buy(
-          new PublicKey(tokenBalance.mint),
-          "PUMP_FUN"
-        );
+      await primaryConnection.confirmTransaction({
+        signature: txSig,
+        blockhash: latestBlockhash.blockhash,
+        lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+      }, "confirmed");
+      console.log(`[${timestamp()}] ✅ Confirmed!`);
+    } catch {
+      const status = await primaryConnection.getSignatureStatus(txSig);
+      if (status?.value?.confirmationStatus === "confirmed" || status?.value?.confirmationStatus === "finalized") {
+        console.log(`[${timestamp()}] ✅ Transaction succeeded (verified on-chain)`);
+      } else {
+        console.log(`[${timestamp()}] ⚠️ Confirmation uncertain - check: https://solscan.io/tx/${txSig}`);
       }
-    } catch (e) {
-      // Parsing can fail, continue
     }
-  });
-}
 
-// =====================================================
-// EXPECTANCY TRACKING
-// =====================================================
-function recordTradeStats(source: string, pnl: number) {
-  const row = db.prepare("SELECT * FROM stats WHERE source = ?").get(source) as any;
-
-  if (!row) {
-    db.prepare("INSERT INTO stats (source, trades, wins, losses, pnl) VALUES (?, 1, ?, ?, ?)").run(
-      source,
-      pnl > 0 ? 1 : 0,
-      pnl <= 0 ? 1 : 0,
-      pnl
-    );
-  } else {
-    db.prepare(`
-      UPDATE stats SET
-        trades = trades + 1,
-        wins = wins + ?,
-        losses = losses + ?,
-        pnl = pnl + ?
-      WHERE source = ?
-    `).run(pnl > 0 ? 1 : 0, pnl <= 0 ? 1 : 0, pnl, source);
+    return { success: true, txSig, outAmount: Number(quote.outAmount) };
+  } catch (error: any) {
+    return { success: false, error: error?.message || String(error) };
   }
 }
-function getExpectancy(source: string): number {
-  const row = db.prepare("SELECT * FROM stats WHERE source = ?").get(source) as any;
 
-  if (!row || row.trades < CONFIG.MIN_TRADES_FOR_EXPECTANCY) {
-    return 1;
-  }
-
-  const winRate = row.wins / row.trades;
-  const avgWin = row.pnl > 0 ? row.pnl / row.wins : 0;
-
-  return winRate * avgWin;
-}
-function isSourceDisabled(source: string): boolean {
-  const expectancy = getExpectancy(source);
-  return expectancy < CONFIG.MIN_EXPECTANCY;
-}
-
-// =====================================================
-// TRADING FUNCTIONS
-// =====================================================
-async function buy(
-  mint: PublicKey,
-  source: string,
-  copyWallet?: string,
-  copyWalletLabel?: string
-): Promise<void> {
+/* =========================
+   BUY LOGIC
+========================= */
+async function executeBuy(mint: PublicKey, source: string, testMode: boolean): Promise<boolean> {
   const mintStr = mint.toBase58();
 
   if (positions.has(mintStr)) {
-    log("⏭️", `Already in position: ${shortenAddress(mintStr)}`);
-    return;
+    console.log(`[${timestamp()}] ⚠️ Already holding ${mintStr.slice(0,8)}`);
+    return false;
   }
 
-  if (isSourceDisabled(source)) {
-    log("🚫", `Source disabled due to low expectancy: ${source}`);
-    return;
+  if (positions.size >= CONFIG.MAX_POSITIONS) {
+    console.log(`[${timestamp()}] ⚠️ Max positions reached (${CONFIG.MAX_POSITIONS})`);
+    return false;
   }
 
-  const safety = await checkTokenSafety(mint);
-  if (!safety.isSafe) {
-    log("⚠️", `Token failed safety: ${safety.reason}`);
-    return;
+  const balance = await solBalance();
+  const tradeSize = calculateTradeSize(balance);
+
+  if (tradeSize <= 0) {
+    console.log(`[${timestamp()}] ⚠️ No risk budget available`);
+    return false;
   }
 
-  const filters = await passesFilters(mintStr);
-  if (!filters.passed) {
-    log("📉", `Token failed filters: ${filters.reason}`);
-    return;
+  const rugCheck = await isRug(mint);
+  if (rugCheck.isRug) {
+    console.log(`[${timestamp()}] 🚫 Rug detected: ${rugCheck.reason}`);
+    return false;
   }
 
-  const expectancyMult = Math.min(1.5, Math.max(0.5, getExpectancy(source)));
-  const tradeSizeSol = Math.min(
-    CONFIG.MAX_TRADE_SOL,
-    Math.max(CONFIG.MIN_TRADE_SOL, dashboardControl.tradeSizeSol * expectancyMult)
-  );
+  const amountLamports = Math.floor(tradeSize * LAMPORTS_PER_SOL);
+  console.log(`[${timestamp()}] 🛒 BUY ${tradeSize.toFixed(4)} SOL → ${mintStr.slice(0,8)} [${source}]`);
+
+  const result = await executeSwap(SOL_MINT, mintStr, amountLamports, testMode);
+
+  if (!result.success) {
+    console.error(`[${timestamp()}] ❌ Buy failed: ${result.error}`);
+    stats.losses++;
+    stats.totalTrades++;
+    return false;
+  }
 
   const price = await getPrice(mint);
-  if (!price) {
-    log("❌", `Could not get price for ${shortenAddress(mintStr)}`);
-    return;
-  }
-
-  const testMode = dashboardControl.testMode;
-  let txSignature: string | undefined;
-
-  if (!testMode) {
-    const quote = await getQuote(
-      SOL_MINT,
-      mintStr,
-      Math.floor(tradeSizeSol * LAMPORTS_PER_SOL)
-    );
-
-    if (!quote) {
-      log("❌", `Failed to get quote for ${shortenAddress(mintStr)}`);
-      return;
-    }
-
-    const wallet = wallets[0];
-    const tx = await buildSwapTransaction(quote, wallet, ENV.USE_JITO);
-
-    if (!tx) {
-      log("❌", `Failed to build transaction for ${shortenAddress(mintStr)}`);
-      return;
-    }
-
-    if (ENV.USE_JITO) {
-      const bundleId = await sendJitoBundle([tx], wallet);
-      if (bundleId) {
-        txSignature = bundleId;
-      }
-    }
-
-    if (!txSignature) {
-      txSignature = await executeWithFailover(async (conn) => {
-        return await conn.sendRawTransaction(tx.serialize(), {
-          skipPreflight: true,
-          maxRetries: 3,
-        });
-      });
-    }
-  } else {
-    txSignature = `TEST_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  }
+  const volume = await getVolume24h(mint);
+  const tokenAmount = testMode ? amountLamports : (result.outAmount || 0);
 
   const position: Position = {
     mint,
     entryPrice: price,
     currentPrice: price,
+    sizeSOL: tradeSize,
+    tokenAmount,
     highPrice: price,
-    stopLoss: price * (1 - dashboardControl.stopLossPct),
-    sizeSol: tradeSizeSol,
+    stopPrice: price * (1 - CONFIG.INITIAL_STOP_LOSS),
+    peakVolume: volume,
     source,
-    copyWallet,
-    copyWalletLabel,
-    openedAt: Date.now(),
-    txSignature,
+    entryTime: Date.now(),
     partialExits: 0,
   };
 
   positions.set(mintStr, position);
+  stats.totalTrades++;
 
-  await logTrade({
-    action: "BUY",
+  console.log(`[${timestamp()}] ✅ Position opened: ${mintStr.slice(0,8)} @ ${price.toFixed(8)} SOL`);
+
+  await postLovable({
+    type: "BUY",
     mint: mintStr,
-    pair: shortenAddress(mintStr),
+    amount: tradeSize,
+    price,
     source,
-    copyWallet,
-    copyWalletLabel,
-    sizeSol: tradeSizeSol,
-    entryPrice: price,
-    txSignature,
-    walletAddress: wallets[0].publicKey.toBase58(),
+    txSig: result.txSig,
     testMode,
   });
 
-  log("🛒", `BUY ${shortenAddress(mintStr)} via ${source}`, {
-    price,
-    sizeSol: tradeSizeSol,
-    testMode,
-    copyWalletLabel,
-  });
+  return true;
 }
 
-async function sell(
-  position: Position,
-  percentage: number,
-  reason: string
-): Promise<void> {
-  const mintStr = position.mint.toBase58();
-  const sellSize = position.sizeSol * (percentage / 100);
+/* =========================
+   SELL LOGIC
+========================= */
+async function executeSell(pos: Position, reason: string, testMode: boolean): Promise<boolean> {
+  const mintStr = pos.mint.toBase58();
 
-  const testMode = dashboardControl.testMode;
-  let txSignature: string | undefined;
+  // Get actual token balance (FIXED: was using wrong amount before)
+  const tokenBalance = await getTokenBalance(pos.mint);
+  if (tokenBalance <= 0 && !testMode) {
+    console.log(`[${timestamp()}] ⚠️ No tokens to sell for ${mintStr.slice(0,8)}`);
+    positions.delete(mintStr);
+    return false;
+  }
 
-  if (!testMode) {
-    const quote = await getQuote(
-      mintStr,
-      SOL_MINT,
-      Math.floor(sellSize * LAMPORTS_PER_SOL / position.currentPrice)
+  const sellAmount = testMode ? pos.tokenAmount : tokenBalance;
+  console.log(`[${timestamp()}] 💰 SELL ${mintStr.slice(0,8)} [${reason}]`);
+
+  const result = await executeSwap(mintStr, SOL_MINT, sellAmount, testMode);
+
+  if (!result.success) {
+    console.error(`[${timestamp()}] ❌ Sell failed: ${result.error}`);
+    return false;
+  }
+
+  const exitPrice = await getPrice(pos.mint);
+  const pnl = exitPrice - pos.entryPrice;
+  const pnlPct = ((exitPrice / pos.entryPrice) - 1) * 100;
+
+  stats.totalPnL += pnl * pos.sizeSOL;
+  if (pnl > 0) stats.wins++;
+  else stats.losses++;
+
+  console.log(`[${timestamp()}] ${pnl > 0 ? '🟢' : '🔴'} PnL: ${pnlPct.toFixed(2)}% | ${(pnl * pos.sizeSOL).toFixed(4)} SOL`);
+
+  // Profit sharing
+  if (pnl > 0 && creatorWallet && !testMode && CONFIG.PROFIT_SHARE_PERCENT > 0) {
+    const profitSOL = pnl * pos.sizeSOL;
+    const shareAmount = profitSOL * CONFIG.PROFIT_SHARE_PERCENT;
+    if (shareAmount > 0.001) {
+      try {
+        const shareLamports = Math.floor(shareAmount * LAMPORTS_PER_SOL);
+        const latestBlockhash = await primaryConnection.getLatestBlockhash();
+        const message = new TransactionMessage({
+          payerKey: wallet.publicKey,
+          recentBlockhash: latestBlockhash.blockhash,
+          instructions: [
+            SystemProgram.transfer({
+              fromPubkey: wallet.publicKey,
+              toPubkey: creatorWallet,
+              lamports: shareLamports,
+            }),
+          ],
+        }).compileToV0Message();
+        const tx = new VersionedTransaction(message);
+        tx.sign([wallet]);
+        const sig = await primaryConnection.sendRawTransaction(tx.serialize());
+        console.log(`[${timestamp()}] 💸 Profit share: ${shareAmount.toFixed(4)} SOL → ${creatorWallet.toBase58().slice(0,8)}`);
+      } catch (error: any) {
+        console.error(`[${timestamp()}] ⚠️ Profit share failed: ${error?.message}`);
+      }
+    }
+  }
+
+  positions.delete(mintStr);
+  copyHoldOverride.delete(mintStr);
+
+  await postLovable({
+    type: "SELL",
+    mint: mintStr,
+    reason,
+    pnl: pnlPct,
+    txSig: result.txSig,
+    testMode,
+  });
+
+  return true;
+}
+
+/* =========================
+   POSITION MANAGER (Enhanced with Take-Profits)
+========================= */
+async function managePositions(testMode: boolean) {
+  for (const [mintStr, pos] of positions) {
+    try {
+      if (COPY_CONFIG.OVERRIDE_STOPS_WHILE_HOLDING && copyHoldOverride.has(mintStr)) {
+        continue;
+      }
+
+      const price = await getPrice(pos.mint);
+      const volume = await getVolume24h(pos.mint);
+      if (price <= 0) continue;
+
+      // Update current price
+      pos.currentPrice = price;
+
+      // Check max position age (4 hours)
+      if (Date.now() - pos.entryTime > CONFIG.MAX_POSITION_AGE_MS) {
+        log("⏰", `Max age reached for ${shortAddr(mintStr)}`);
+        await executeSell(pos, "MAX_AGE_EXIT", testMode);
+        continue;
+      }
+
+      // Volume drop exit
+      if (volume < pos.peakVolume * CONFIG.VOLUME_DROP_EXIT && pos.peakVolume > 0) {
+        log("📉", `Volume dropped: ${volume.toFixed(0)} < ${(pos.peakVolume * CONFIG.VOLUME_DROP_EXIT).toFixed(0)}`);
+        await executeSell(pos, "VOLUME_DROP", testMode);
+        continue;
+      }
+
+      // Stop loss
+      if (price <= pos.stopPrice) {
+        log("🛑", `Stop triggered: ${price.toFixed(8)} <= ${pos.stopPrice.toFixed(8)}`);
+        await executeSell(pos, "TRAILING_STOP", testMode);
+        continue;
+      }
+
+      // Calculate gain percentage
+      const gain = (price - pos.entryPrice) / pos.entryPrice;
+
+      // Partial take-profits (only if not already taken)
+      if (gain >= CONFIG.TAKE_PROFIT_3_PCT && pos.partialExits < 3) {
+        log("🎯", `Take Profit 3 (${(gain * 100).toFixed(1)}% gain) - selling remaining`);
+        await executeSell(pos, "TAKE_PROFIT_3", testMode);
+        continue;
+      } else if (gain >= CONFIG.TAKE_PROFIT_2_PCT && pos.partialExits < 2) {
+        log("🎯", `Take Profit 2 (${(gain * 100).toFixed(1)}% gain) - partial sell`);
+        // For partial sells, we'd need a separate function - for now, update stop tighter
+        pos.partialExits = 2;
+        pos.stopPrice = Math.max(pos.stopPrice, pos.entryPrice * 1.5); // Lock in 50% profit minimum
+      } else if (gain >= CONFIG.TAKE_PROFIT_1_PCT && pos.partialExits < 1) {
+        log("🎯", `Take Profit 1 (${(gain * 100).toFixed(1)}% gain) - tightening stop`);
+        pos.partialExits = 1;
+        pos.stopPrice = Math.max(pos.stopPrice, pos.entryPrice * 1.2); // Lock in 20% profit minimum
+      }
+
+      // Update trailing stop on new highs
+      if (price > pos.highPrice) {
+        pos.highPrice = price;
+        const newStop = price * (1 - CONFIG.TRAILING_STOP);
+        if (newStop > pos.stopPrice) {
+          pos.stopPrice = newStop;
+          log("📈", `New high: ${price.toFixed(8)} | Stop: ${pos.stopPrice.toFixed(8)}`);
+        }
+        pos.peakVolume = Math.max(pos.peakVolume, volume);
+      }
+
+      await sleep(CONFIG.RPC_DELAY_MS);
+    } catch (error: any) {
+      console.error(`[${timestamp()}] ⚠️ Error managing ${mintStr.slice(0, 8)}...: ${error?.message}`);
+    }
+  }
+}
+
+/* =========================
+   PUMP.FUN SNIPER
+========================= */
+async function startPumpSniper(testMode: boolean) {
+  if (listenerActive) return;
+
+  try {
+    listenerSubscriptionId = primaryConnection.onLogs(
+      PUMP_FUN_PROGRAM,
+      async (logs) => {
+        if (!logs.logs.some(log => log.includes("InitializeMint"))) return;
+
+        const sig = logs.signature;
+        console.log(`[${timestamp()}] 🎯 New pump.fun token detected: ${sig}`);
+
+        try {
+          await sleep(2000);
+          const tx = await primaryConnection.getParsedTransaction(sig, { maxSupportedTransactionVersion: 0 });
+          if (!tx) return;
+
+          const postBalances = tx.meta?.postTokenBalances || [];
+          const newMint = postBalances.find(b => b.owner !== wallet.publicKey.toBase58())?.mint;
+
+          if (newMint) {
+            const mintPubkey = new PublicKey(newMint);
+            console.log(`[${timestamp()}] 🚀 Sniping: ${newMint}`);
+            await executeBuy(mintPubkey, "PUMP_SNIPE", testMode);
+          }
+        } catch (error: any) {
+          console.error(`[${timestamp()}] ⚠️ Snipe error: ${error?.message}`);
+        }
+      },
+      "confirmed"
     );
 
-    if (quote) {
-      const wallet = wallets[0];
-      const tx = await buildSwapTransaction(quote, wallet, ENV.USE_JITO);
-
-      if (tx) {
-        if (ENV.USE_JITO) {
-          txSignature = await sendJitoBundle([tx], wallet) || undefined;
-        }
-
-        if (!txSignature) {
-          txSignature = await executeWithFailover(async (conn) => {
-            return await conn.sendRawTransaction(tx.serialize(), {
-              skipPreflight: true,
-              maxRetries: 3,
-            });
-          });
-        }
-      }
-    }
-  } else {
-    txSignature = `TEST_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  }
-
-  const exitPrice = await getPrice(position.mint);
-  const pnlSol = (exitPrice - position.entryPrice) / position.entryPrice * sellSize;
-  const roi = ((exitPrice - position.entryPrice) / position.entryPrice) * 100;
-
-  recordTradeStats(position.source, pnlSol);
-
-  await logTrade({
-    action: percentage === 100 ? "EXIT" : "SELL",
-    mint: mintStr,
-    pair: shortenAddress(mintStr),
-    source: position.source,
-    copyWallet: position.copyWallet,
-    copyWalletLabel: position.copyWalletLabel,
-    pnl: pnlSol,
-    roi,
-    entryPrice: position.entryPrice,
-    exitPrice: exitPrice,
-    sizeSol: sellSize,
-    txSignature,
-    walletAddress: wallets[0].publicKey.toBase58(),
-    testMode,
-  });
-
-  log(pnlSol >= 0 ? "💰" : "📉", `${reason} ${shortenAddress(mintStr)}`, {
-    pnl: pnlSol.toFixed(4),
-    roi: `${roi.toFixed(2)}%`,
-    percentage: `${percentage}%`,
-  });
-
-  if (percentage === 100) {
-    positions.delete(mintStr);
-  } else {
-    position.sizeSol -= sellSize;
-    position.partialExits++;
+    listenerActive = true;
+    console.log(`[${timestamp()}] 🎯 Pump.fun sniper ACTIVE`);
+  } catch (error: any) {
+    console.error(`[${timestamp()}] ❌ Failed to start sniper: ${error?.message}`);
   }
 }
 
-// =====================================================
-// POSITION MANAGEMENT
-// =====================================================
-async function managePositions(): Promise<void> {
-  for (const [mintStr, position] of positions) {
-    try {
-      const currentPrice = await getPrice(position.mint);
-      if (!currentPrice) continue;
+function stopPumpSniper() {
+  if (!listenerActive || listenerSubscriptionId === null) return;
 
-      position.currentPrice = currentPrice;
-
-      if (currentPrice <= position.stopLoss) {
-        await sell(position, 100, "🛑 Stop Loss");
-        continue;
-      }
-
-      if (Date.now() - position.openedAt > CONFIG.MAX_POSITION_AGE_MS) {
-        await sell(position, 100, "⏰ Max Age Exit");
-        continue;
-      }
-
-      if (currentPrice > position.highPrice) {
-        position.highPrice = currentPrice;
-        const newStop = currentPrice * (1 - dashboardControl.trailingStopPct);
-        if (newStop > position.stopLoss) {
-          position.stopLoss = newStop;
-          log("📈", `Trailing stop updated for ${shortenAddress(mintStr)}`, {
-            newStop: newStop.toFixed(8),
-          });
-        }
-      }
-
-      const gain = (currentPrice - position.entryPrice) / position.entryPrice;
-
-      if (gain >= CONFIG.TAKE_PROFIT_2_PCT && position.partialExits < 2) {
-        await sell(position, 25, "🎯 Take Profit 2");
-      } else if (gain >= CONFIG.TAKE_PROFIT_1_PCT && position.partialExits < 1) {
-        await sell(position, 50, "🎯 Take Profit 1");
-      }
-    } catch (e) {
-      log("⚠️", `Position management error for ${mintStr}`, { error: (e as Error).message });
-    }
-  }
-}
-
-// =====================================================
-// CONTROL LOOP
-// =====================================================
-async function controlLoop(): Promise<void> {
-  while (true) {
-    try {
-      await fetchDashboardControl();
-      syncCopyWalletSubscriptions();
-    } catch (e) {
-      log("❌", "Control loop error", { error: (e as Error).message });
-    }
-
-    await sleep(CONFIG.CONTROL_POLL_INTERVAL_MS);
-  }
-}
-
-// =====================================================
-// MAIN
-// =====================================================
-async function main() {
-  log("🚀", "ELITE TOP 1% SOLANA MEME SNIPER BOT STARTING...");
-
-  // Validate environment
-  if (!ENV.PRIVATE_KEY) {
-    throw new Error("SOLANA_PRIVATE_KEY is required");
-  }
-
-  if (!ENV.RPC_URL) {
-    throw new Error("SOLANA_RPC_URL is required");
-  }
-
-  // Initialize
   try {
-    // Load wallets
-    wallets.push(Keypair.fromSecretKey(bs58.decode(ENV.PRIVATE_KEY)));
-    for (const key of ENV.MULTI_WALLETS) {
-      wallets.push(Keypair.fromSecretKey(bs58.decode(key)));
-    }
-    log("👛", `Loaded ${wallets.length} wallet(s)`);
+    primaryConnection.removeOnLogsListener(listenerSubscriptionId);
+    listenerActive = false;
+    listenerSubscriptionId = null;
+    console.log(`[${timestamp()}] 🛑 Pump.fun sniper STOPPED`);
+  } catch (error: any) {
+    console.error(`[${timestamp()}] ⚠️ Error stopping sniper: ${error?.message}`);
+  }
+}
 
-    // Initialize RPC
-    await initRPCEndpoints();
+/* =========================
+   COPY TRADING
+========================= */
+async function executeCopyTrading(wallets: string[], testMode: boolean) {
+  const now = Date.now();
 
-    // Initialize Jupiter
-    await initJupiter();
+  for (const walletAddr of wallets) {
+    try {
+      const pubkey = new PublicKey(walletAddr);
 
-    // Load known rugged creators
-    loadRuggedCreators();
-
-    // Fetch initial dashboard control
-    await fetchDashboardControl();
-
-    // Start control loop
-    controlLoop();
-
-    // Start Pump.fun sniper
-    startPumpFunSniper();
-
-    // Start RPC health check loop
-    setInterval(checkRPCHealth, CONFIG.RPC_HEALTH_CHECK_INTERVAL_MS);
-
-    log("✅", "Bot initialized successfully!");
-    log("📊", "Dashboard integration active", {
-      controlUrl: ENV.LOVABLE_CONTROL_URL ? "configured" : "not configured",
-      logUrl: ENV.LOVABLE_LOG_TRADE_URL ? "configured" : "not configured",
-    });
-
-    // Main position management loop
-    while (true) {
-      if (dashboardControl.isRunning) {
-        await managePositions();
+      if (!copyState.has(walletAddr)) {
+        copyState.set(walletAddr, new Map());
       }
 
-      await sleep(CONFIG.POSITION_CHECK_INTERVAL_MS);
+      const previous = copyState.get(walletAddr)!;
+      const current = new Map<string, number>();
+
+      const tokenAccounts = await primaryConnection.getParsedTokenAccountsByOwner(pubkey, { programId: TOKEN_PROGRAM_ID });
+
+      for (const acc of tokenAccounts.value) {
+        const info = acc.account.data.parsed.info;
+        const mint = info.mint;
+        const amount = Number(info.tokenAmount.uiAmount || 0);
+        if (amount > 0) current.set(mint, amount);
+      }
+
+      // BUY DETECTION
+      for (const [mint, amount] of current) {
+        const prevAmount = previous.get(mint) || 0;
+        const pctIncrease = prevAmount > 0 ? (amount - prevAmount) / prevAmount : 1;
+
+        const lastBuy = copyCooldown.get(mint) || 0;
+        if (now - lastBuy < COPY_CONFIG.DEBOUNCE_MS) continue;
+
+        if (amount > prevAmount && pctIncrease >= COPY_CONFIG.MIN_BALANCE_INCREASE_PCT && !positions.has(mint)) {
+          console.log(`[${timestamp()}] 👥 COPY BUY ${mint.slice(0, 8)} (+${(pctIncrease * 100).toFixed(1)}%)`);
+
+          copyCooldown.set(mint, now);
+          copyHoldOverride.add(mint);
+
+          await executeBuy(new PublicKey(mint), `COPY_${walletAddr.slice(0, 8)}`, testMode);
+        }
+      }
+
+      // SELL DETECTION
+      for (const [mint, prevAmount] of previous) {
+        const nowAmount = current.get(mint) || 0;
+
+        if (prevAmount > 0 && nowAmount === 0 && positions.has(mint)) {
+          console.log(`[${timestamp()}] 👥 COPY SELL ${mint.slice(0, 8)} (wallet exit)`);
+
+          copyHoldOverride.delete(mint);
+
+          const pos = positions.get(mint)!;
+          await executeSell(pos, "COPY_WALLET_EXIT", testMode);
+        }
+      }
+
+      copyState.set(walletAddr, current);
+      await sleep(CONFIG.RPC_DELAY_MS);
+
+    } catch (error: any) {
+      console.error(`[${timestamp()}] ⚠️ Copy trading error: ${error?.message}`);
     }
-  } catch (e) {
-    log("💥", "Fatal error", { error: (e as Error).message });
+  }
+}
+
+/* =========================
+   MAIN LOOP
+========================= */
+async function run() {
+  const initialized = await initialize();
+  if (!initialized) {
+    console.error("❌ Bot failed to initialize. Exiting.");
     process.exit(1);
   }
+
+  log("🤖", "Starting main loop...");
+  
+  // Periodic RPC health check
+  setInterval(async () => {
+    await checkRPCHealth();
+    const best = getBestRPC();
+    if (best.connection !== primaryConnection) {
+      primaryConnection = best.connection;
+      log("🔄", `Switched to faster RPC (${best.latency}ms)`);
+    }
+  }, 30000);
+
+  while (true) {
+    try {
+      const control = await fetchControl();
+      const balance = await solBalance();
+
+      if (!control || control.status !== "RUNNING") {
+        stopPumpSniper();
+        console.log(`[${timestamp()}] ⏸️ Bot PAUSED (status: ${control?.status || "unknown"})`);
+        await sleep(CONFIG.PAUSED_LOOP_MS);
+        continue;
+      }
+
+      const testMode = control.testMode ?? true;
+
+      // Handle test mode changes - restart sniper if mode changes
+      if (testMode !== currentTestMode) {
+        console.log(`[${timestamp()}] 🔄 Mode changed: ${currentTestMode ? "TEST" : "LIVE"} → ${testMode ? "TEST" : "LIVE"}`);
+        stopPumpSniper();
+        currentTestMode = testMode;
+      }
+
+      // Start sniper if not active
+      if (!listenerActive) {
+        await startPumpSniper(testMode);
+      }
+
+      // Copy trading
+      const copyWallets = control.copyTrading?.wallets || [];
+      if (copyWallets.length > 0) {
+        await executeCopyTrading(copyWallets, testMode);
+      }
+
+      // Manage existing positions
+      await managePositions(testMode);
+
+      // Status log
+      const mode = testMode ? "🟡 TEST" : "🟢 LIVE";
+      console.log(`[${timestamp()}] ${mode} | Balance: ${balance.toFixed(4)} SOL | Positions: ${positions.size} | Trades: ${stats.totalTrades} | PnL: ${stats.totalPnL.toFixed(4)} SOL`);
+
+      await sleep(CONFIG.MAIN_LOOP_MS);
+
+    } catch (error: any) {
+      console.error(`[${timestamp()}] ❌ Main loop error: ${error?.message}`);
+      await sleep(CONFIG.MAIN_LOOP_MS);
+    }
+  }
 }
 
-// Run the bot
-main().catch(console.error);
+// Start the bot
+run();

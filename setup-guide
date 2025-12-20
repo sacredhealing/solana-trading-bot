@@ -1,0 +1,176 @@
+# 🚀 Ultimate Meme Sniper Bot - Setup Guide
+
+## Overview
+
+This bot includes:
+- ✅ **Pump.fun Sniping** - Auto-detect new token launches
+- ✅ **Copy Trading** - Mirror successful wallets
+- ✅ **Trailing Stops** - Lock in profits automatically
+- ✅ **Volume Exit** - Sell when volume drops
+- ✅ **Rug Detection** - Skip scam tokens
+- ✅ **Risk Management** - 30% max exposure, position sizing
+- ✅ **Full Test Mode** - Simulate without real money
+- ✅ **Dashboard Control** - Start/stop from Lovable UI
+
+---
+
+## 📋 Railway Environment Variables
+
+Add these in Railway → Your Project → Variables:
+
+### Required Variables
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `SOLANA_RPC_URL` | Your Helius RPC URL | `https://mainnet.helius-rpc.com/?api-key=YOUR_KEY` |
+| `SOLANA_PRIVATE_KEY` | Wallet private key (base58) | `5J7...xyz` |
+| `JUPITER_API_KEY` | From https://portal.jup.ag | `abc123...` |
+| `LOVABLE_CONTROL_URL` | Supabase control endpoint | `https://xxx.supabase.co/functions/v1/control-external-bot` |
+| `LOVABLE_API_URL` | Supabase logging endpoint | `https://xxx.supabase.co/functions/v1/log-trade` |
+| `SUPABASE_API_KEY` | Supabase anon key | `eyJ...` |
+
+### Optional Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `CREATOR_WALLET` | Wallet for profit sharing (11.11%) | None (disabled) |
+
+---
+
+## 🔧 Configuration (in code)
+
+Edit these in `ultimate-meme-bot.ts` if needed:
+
+```typescript
+const CONFIG = {
+  MAX_RISK_TOTAL: 0.30,        // 30% max portfolio exposure
+  MAX_POSITIONS: 10,           // Max concurrent positions
+  INITIAL_STOP_LOSS: 0.12,     // 12% initial stop loss
+  TRAILING_STOP: 0.05,         // 5% trailing stop from highs
+  VOLUME_DROP_EXIT: 0.50,      // Exit if volume drops 50%
+  MIN_LP_SOL: 5,               // Minimum liquidity filter
+  MAX_TOP_HOLDER: 20,          // Skip if single holder > 20%
+  PROFIT_SHARE_PERCENT: 0.1111 // 11.11% profit share (set 0 to disable)
+};
+```
+
+---
+
+## 🚀 Deployment Steps
+
+### 1. Update package.json
+
+Make sure your `package.json` has:
+```json
+"scripts": {
+  "start": "npx tsx ultimate-meme-bot.ts"
+}
+```
+
+### 2. Push to GitHub
+
+```bash
+git add .
+git commit -m "Update to ultimate meme bot"
+git push
+```
+
+### 3. Railway Auto-Deploys
+
+Railway will automatically redeploy when you push.
+
+### 4. Check Logs
+
+In Railway → Deployments → View Logs
+
+You should see:
+```
+============================================================
+ 🚀 ULTIMATE MEME SNIPER BOT - Professional Edition
+============================================================
+✅ RPC Connected
+✅ Wallet: YOUR_WALLET_ADDRESS
+✅ Jupiter API Connected
+✅ Balance: X.XXXX SOL
+✅ Jupiter API healthy
+============================================================
+ ✅ Bot initialized successfully!
+============================================================
+```
+
+---
+
+## 📊 Dashboard Control
+
+Your Lovable dashboard needs to send this format:
+
+```json
+{
+  "status": "RUNNING",       // or "STOPPED"
+  "testMode": true,          // true = simulate, false = live
+  "copyTrading": {
+    "wallets": ["WALLET1", "WALLET2"]  // optional
+  }
+}
+```
+
+---
+
+## 🎯 How It Works
+
+### Pump.fun Sniping
+1. Bot listens for new token launches on pump.fun
+2. Runs rug check (liquidity, top holder %)
+3. If safe → auto-buys with calculated position size
+4. Tracks position with trailing stop
+
+### Copy Trading
+1. Add wallet addresses to `copyTrading.wallets` in dashboard
+2. Bot monitors those wallets for new token buys
+3. Mirrors their trades (with your risk settings)
+
+### Position Management
+1. **Trailing Stop**: If price goes up, stop moves up
+2. **Volume Exit**: If 24h volume drops 50%, auto-sell
+3. **Initial Stop**: 12% stop loss from entry
+
+### Test Mode
+- All trades simulated (no real money)
+- Positions tracked in memory
+- PnL calculated from real prices
+- Great for testing strategy
+
+---
+
+## ⚠️ Important Notes
+
+1. **Start in TEST MODE** - Always test first!
+2. **Small Balance** - Start with small amount (1-5 SOL)
+3. **Monitor Logs** - Watch Railway logs for errors
+4. **Profit Sharing** - 11.11% of profits sent to CREATOR_WALLET (optional)
+
+---
+
+## 🆘 Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| "Jupiter API offline" | Check JUPITER_API_KEY is valid |
+| "Control fetch failed" | Check LOVABLE_CONTROL_URL and SUPABASE_API_KEY |
+| "Initialization failed" | Check all env vars are set correctly |
+| No trades happening | Make sure dashboard status is "RUNNING" |
+| Sniper not active | Bot auto-starts when status = RUNNING |
+
+---
+
+## 📁 Files
+
+- `ultimate-meme-bot.ts` - The main bot (USE THIS ONE)
+- `bot.ts` - Old simple SOL/USDC bot
+- `newbot.ts` - Original version with bugs
+- `package.json` - Dependencies
+- `SETUP-GUIDE.md` - This guide
+
+---
+
+Good luck! 🚀

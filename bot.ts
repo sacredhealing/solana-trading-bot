@@ -125,9 +125,9 @@ const stats: BotStats = {
 /* =========================
    COPY TRADING STATE
 ========================= */
-const copyState = new Map<string, Map<string, number>>(); // wallet → mint → balance
-const copyCooldown = new Map<string, number>(); // mint → last buy timestamp
-const copyHoldOverride = new Set<string>(); // mints still held by copied wallets
+const copyState = new Map<string, Map<string, number>>();
+const copyCooldown = new Map<string, number>();
+const copyHoldOverride = new Set<string>();
 
 /* =========================
    UTILS
@@ -352,15 +352,229 @@ function calculateTradeSize(balance: number): number {
 /* =========================
    SWAP EXECUTION
 ========================= */
-// executeSwap() kept exactly as original, unchanged
-// [Your full executeSwap() code goes here, same as original bot]
-// For brevity, omitted in this snippet but must be copied exactly
+async function executeSwap(
+  inputMint: string,
+  outputMint: string,
+  amount: number,
+  testMode: boolean
+): Promise<{ success: boolean; txSig?: string; outAmount?: number; error?: string }> {
+  if (testMode) {
+    console.log(`[${timestamp()}] 🟡 TEST: Swap ${amount} ${inputMint.slice(0,8)} → ${outputMint.slice(0,8)}`);
+    return { success: true, txSig: "TEST_" + Date.now(), outAmount: amount };
+  }
+
+  try {
+    const quote = await jupiter.quoteGet({
+      inputMint,
+      outputMint,
+      amount: Math.floor(amount),
+      slippageBps: CONFIG.SLIPPAGE_BPS,
+    });
+
+    if ("error" in quote) {
+      return { success: false, error: `Quote error: ${JSON.stringify(quote)}` };
+    }
+
+    const swapResponse = await jupiter.swapPost({
+      swapRequest: {
+        quoteResponse: quote,
+        userPublicKey: wallet.publicKey.toBase58(),
+        wrapAndUnwrapSol: true,
+        dynamicComputeUnitLimit: true,
+      },
+    });
+
+    if (!swapResponse.swapTransaction) {
+      return { success: false, error: "No swap transaction returned" };
+    }
+
+    const txBuffer = Buffer.from(swapResponse.swapTransaction, "base64");
+    const tx = VersionedTransaction.deserialize(txBuffer);
+    tx.sign([wallet]);
+
+    const txSig = await connection.sendRawTransaction(tx.serialize(), {
+      skipPreflight: false,
+      maxRetries: 3,
+    });
+
+    console.log(`[${timestamp()}] ⏳ Confirming: ${txSig}`);
+
+    const latestBlockhash = await connection.getLatestBlockhash();
+    try {
+      await connection.confirmTransaction({
+        signature: txSig,
+        blockhash: latestBlockhash.blockhash,
+        lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+      }, "confirmed");
+      console.log(`[${timestamp()}] ✅ Confirmed!`);
+    } catch {
+      const status = await connection.getSignatureStatus(txSig);
+      if (status?.value?.confirmationStatus === "confirmed" || status?.value?.confirmationStatus === "finalized") {
+        console.log(`[${timestamp()}] ✅ Transaction succeeded (verified on-chain)`);
+      } else {
+        console.log(`[${timestamp()}] ⚠️ Confirmation uncertain - check: https://solscan.io/tx/${txSig}`);
+      }
+    }
+
+    return { success: true, txSig, outAmount: Number(quote.outAmount) };
+  } catch (error: any) {
+    return { success: false, error: error?.message || String(error) };
+  }
+}
 
 /* =========================
-   BUY / SELL LOGIC
+   BUY LOGIC
 ========================= */
-// executeBuy() and executeSell() kept exactly as original, unchanged
-// For brevity, omitted in this snippet but must be copied exactly
+async function executeBuy(mint: PublicKey, source: string, testMode: boolean): Promise<boolean> {
+  const mintStr = mint.toBase58();
+
+  if (positions.has(mintStr)) {
+    console.log(`[${timestamp()}] ⚠️ Already holding ${mintStr.slice(0,8)}`);
+    return false;
+  }
+
+  if (positions.size >= CONFIG.MAX_POSITIONS) {
+    console.log(`[${timestamp()}] ⚠️ Max positions reached (${CONFIG.MAX_POSITIONS})`);
+    return false;
+  }
+
+  const balance = await solBalance();
+  const tradeSize = calculateTradeSize(balance);
+
+  if (tradeSize <= 0) {
+    console.log(`[${timestamp()}] ⚠️ No risk budget available`);
+    return false;
+  }
+
+  const rugCheck = await isRug(mint);
+  if (rugCheck.isRug) {
+    console.log(`[${timestamp()}] 🚫 Rug detected: ${rugCheck.reason}`);
+    return false;
+  }
+
+  const amountLamports = Math.floor(tradeSize * LAMPORTS_PER_SOL);
+  console.log(`[${timestamp()}] 🛒 BUY ${tradeSize.toFixed(4)} SOL → ${mintStr.slice(0,8)} [${source}]`);
+
+  const result = await executeSwap(SOL_MINT, mintStr, amountLamports, testMode);
+
+  if (!result.success) {
+    console.error(`[${timestamp()}] ❌ Buy failed: ${result.error}`);
+    stats.losses++;
+    stats.totalTrades++;
+    return false;
+  }
+
+  const price = await getPrice(mint);
+  const volume = await getVolume24h(mint);
+  const tokenAmount = testMode ? amountLamports : (result.outAmount || 0);
+
+  const position: Position = {
+    mint,
+    entryPrice: price,
+    sizeSOL: tradeSize,
+    tokenAmount,
+    highPrice: price,
+    stopPrice: price * (1 - CONFIG.INITIAL_STOP_LOSS),
+    peakVolume: volume,
+    source,
+    entryTime: Date.now(),
+  };
+
+  positions.set(mintStr, position);
+  stats.totalTrades++;
+
+  console.log(`[${timestamp()}] ✅ Position opened: ${mintStr.slice(0,8)} @ ${price.toFixed(8)} SOL`);
+
+  await postLovable({
+    type: "BUY",
+    mint: mintStr,
+    amount: tradeSize,
+    price,
+    source,
+    txSig: result.txSig,
+    testMode,
+  });
+
+  return true;
+}
+
+/* =========================
+   SELL LOGIC
+========================= */
+async function executeSell(pos: Position, reason: string, testMode: boolean): Promise<boolean> {
+  const mintStr = pos.mint.toBase58();
+
+  // Get actual token balance (FIXED: was using wrong amount before)
+  const tokenBalance = await getTokenBalance(pos.mint);
+  if (tokenBalance <= 0 && !testMode) {
+    console.log(`[${timestamp()}] ⚠️ No tokens to sell for ${mintStr.slice(0,8)}`);
+    positions.delete(mintStr);
+    return false;
+  }
+
+  const sellAmount = testMode ? pos.tokenAmount : tokenBalance;
+  console.log(`[${timestamp()}] 💰 SELL ${mintStr.slice(0,8)} [${reason}]`);
+
+  const result = await executeSwap(mintStr, SOL_MINT, sellAmount, testMode);
+
+  if (!result.success) {
+    console.error(`[${timestamp()}] ❌ Sell failed: ${result.error}`);
+    return false;
+  }
+
+  const exitPrice = await getPrice(pos.mint);
+  const pnl = exitPrice - pos.entryPrice;
+  const pnlPct = ((exitPrice / pos.entryPrice) - 1) * 100;
+
+  stats.totalPnL += pnl * pos.sizeSOL;
+  if (pnl > 0) stats.wins++;
+  else stats.losses++;
+
+  console.log(`[${timestamp()}] ${pnl > 0 ? '🟢' : '🔴'} PnL: ${pnlPct.toFixed(2)}% | ${(pnl * pos.sizeSOL).toFixed(4)} SOL`);
+
+  // Profit sharing
+  if (pnl > 0 && creatorWallet && !testMode && CONFIG.PROFIT_SHARE_PERCENT > 0) {
+    const profitSOL = pnl * pos.sizeSOL;
+    const shareAmount = profitSOL * CONFIG.PROFIT_SHARE_PERCENT;
+    if (shareAmount > 0.001) {
+      try {
+        const shareLamports = Math.floor(shareAmount * LAMPORTS_PER_SOL);
+        const latestBlockhash = await connection.getLatestBlockhash();
+        const message = new TransactionMessage({
+          payerKey: wallet.publicKey,
+          recentBlockhash: latestBlockhash.blockhash,
+          instructions: [
+            SystemProgram.transfer({
+              fromPubkey: wallet.publicKey,
+              toPubkey: creatorWallet,
+              lamports: shareLamports,
+            }),
+          ],
+        }).compileToV0Message();
+        const tx = new VersionedTransaction(message);
+        tx.sign([wallet]);
+        const sig = await connection.sendRawTransaction(tx.serialize());
+        console.log(`[${timestamp()}] 💸 Profit share: ${shareAmount.toFixed(4)} SOL → ${creatorWallet.toBase58().slice(0,8)}`);
+      } catch (error: any) {
+        console.error(`[${timestamp()}] ⚠️ Profit share failed: ${error?.message}`);
+      }
+    }
+  }
+
+  positions.delete(mintStr);
+  copyHoldOverride.delete(mintStr);
+
+  await postLovable({
+    type: "SELL",
+    mint: mintStr,
+    reason,
+    pnl: pnlPct,
+    txSig: result.txSig,
+    testMode,
+  });
+
+  return true;
+}
 
 /* =========================
    POSITION MANAGER
@@ -368,7 +582,6 @@ function calculateTradeSize(balance: number): number {
 async function managePositions(testMode: boolean) {
   for (const [mintStr, pos] of positions) {
     try {
-      // 🚀 COPY WALLET HOLD OVERRIDE (NEW)
       if (COPY_CONFIG.OVERRIDE_STOPS_WHILE_HOLDING && copyHoldOverride.has(mintStr)) {
         continue;
       }
@@ -406,10 +619,60 @@ async function managePositions(testMode: boolean) {
 /* =========================
    PUMP.FUN SNIPER
 ========================= */
-// startPumpSniper() and stopPumpSniper() unchanged, same as original bot
+async function startPumpSniper(testMode: boolean) {
+  if (listenerActive) return;
+
+  try {
+    listenerSubscriptionId = connection.onLogs(
+      PUMP_FUN_PROGRAM,
+      async (logs) => {
+        if (!logs.logs.some(log => log.includes("InitializeMint"))) return;
+
+        const sig = logs.signature;
+        console.log(`[${timestamp()}] 🎯 New pump.fun token detected: ${sig}`);
+
+        try {
+          await sleep(2000);
+          const tx = await connection.getParsedTransaction(sig, { maxSupportedTransactionVersion: 0 });
+          if (!tx) return;
+
+          const postBalances = tx.meta?.postTokenBalances || [];
+          const newMint = postBalances.find(b => b.owner !== wallet.publicKey.toBase58())?.mint;
+
+          if (newMint) {
+            const mintPubkey = new PublicKey(newMint);
+            console.log(`[${timestamp()}] 🚀 Sniping: ${newMint}`);
+            await executeBuy(mintPubkey, "PUMP_SNIPE", testMode);
+          }
+        } catch (error: any) {
+          console.error(`[${timestamp()}] ⚠️ Snipe error: ${error?.message}`);
+        }
+      },
+      "confirmed"
+    );
+
+    listenerActive = true;
+    console.log(`[${timestamp()}] 🎯 Pump.fun sniper ACTIVE`);
+  } catch (error: any) {
+    console.error(`[${timestamp()}] ❌ Failed to start sniper: ${error?.message}`);
+  }
+}
+
+function stopPumpSniper() {
+  if (!listenerActive || listenerSubscriptionId === null) return;
+
+  try {
+    connection.removeOnLogsListener(listenerSubscriptionId);
+    listenerActive = false;
+    listenerSubscriptionId = null;
+    console.log(`[${timestamp()}] 🛑 Pump.fun sniper STOPPED`);
+  } catch (error: any) {
+    console.error(`[${timestamp()}] ⚠️ Error stopping sniper: ${error?.message}`);
+  }
+}
 
 /* =========================
-   COPY TRADING (UPGRADED)
+   COPY TRADING
 ========================= */
 async function executeCopyTrading(wallets: string[], testMode: boolean) {
   const now = Date.now();
@@ -434,7 +697,7 @@ async function executeCopyTrading(wallets: string[], testMode: boolean) {
         if (amount > 0) current.set(mint, amount);
       }
 
-      /* ===== BUY DETECTION ===== */
+      // BUY DETECTION
       for (const [mint, amount] of current) {
         const prevAmount = previous.get(mint) || 0;
         const pctIncrease = prevAmount > 0 ? (amount - prevAmount) / prevAmount : 1;
@@ -452,7 +715,7 @@ async function executeCopyTrading(wallets: string[], testMode: boolean) {
         }
       }
 
-      /* ===== SELL DETECTION ===== */
+      // SELL DETECTION
       for (const [mint, prevAmount] of previous) {
         const nowAmount = current.get(mint) || 0;
 
@@ -494,4 +757,46 @@ async function run() {
 
       if (!control || control.status !== "RUNNING") {
         stopPumpSniper();
-        console.log(`[
+        console.log(`[${timestamp()}] ⏸️ Bot PAUSED (status: ${control?.status || "unknown"})`);
+        await sleep(CONFIG.PAUSED_LOOP_MS);
+        continue;
+      }
+
+      const testMode = control.testMode ?? true;
+
+      // Handle test mode changes - restart sniper if mode changes
+      if (testMode !== currentTestMode) {
+        console.log(`[${timestamp()}] 🔄 Mode changed: ${currentTestMode ? "TEST" : "LIVE"} → ${testMode ? "TEST" : "LIVE"}`);
+        stopPumpSniper();
+        currentTestMode = testMode;
+      }
+
+      // Start sniper if not active
+      if (!listenerActive) {
+        await startPumpSniper(testMode);
+      }
+
+      // Copy trading
+      const copyWallets = control.copyTrading?.wallets || [];
+      if (copyWallets.length > 0) {
+        await executeCopyTrading(copyWallets, testMode);
+      }
+
+      // Manage existing positions
+      await managePositions(testMode);
+
+      // Status log
+      const mode = testMode ? "🟡 TEST" : "🟢 LIVE";
+      console.log(`[${timestamp()}] ${mode} | Balance: ${balance.toFixed(4)} SOL | Positions: ${positions.size} | Trades: ${stats.totalTrades} | PnL: ${stats.totalPnL.toFixed(4)} SOL`);
+
+      await sleep(CONFIG.MAIN_LOOP_MS);
+
+    } catch (error: any) {
+      console.error(`[${timestamp()}] ❌ Main loop error: ${error?.message}`);
+      await sleep(CONFIG.MAIN_LOOP_MS);
+    }
+  }
+}
+
+// Start the bot
+run();

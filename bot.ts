@@ -1,5 +1,5 @@
 // =====================================================
-// ULTIMATE SOLANA MEME SNIPER BOT 2025 – ELITE EDITION
+// ULTIMATE SOLANA MEME SNIPER BOT 2025 – INSTITUTIONAL
 // =====================================================
 
 import {
@@ -8,19 +8,12 @@ import {
   VersionedTransaction,
   LAMPORTS_PER_SOL,
   PublicKey,
-  SystemProgram,
-  TransactionMessage,
   Commitment,
 } from "@solana/web3.js";
 
-import {
-  getAssociatedTokenAddress,
-  getAccount,
-  TOKEN_PROGRAM_ID,
-} from "@solana/spl-token";
-
 import bs58 from "bs58";
 import { createJupiterApiClient } from "@jup-ag/api";
+import Database from "better-sqlite3";
 
 /* =========================
    ENV
@@ -28,8 +21,7 @@ import { createJupiterApiClient } from "@jup-ag/api";
 const RPC_URL = process.env.SOLANA_RPC_URL!;
 const PRIVATE_KEY = process.env.SOLANA_PRIVATE_KEY!;
 const JUPITER_API_KEY = process.env.JUPITER_API_KEY!;
-const CONTROL_URL = process.env.LOVABLE_CONTROL_URL!;
-const SUPABASE_API_KEY = process.env.SUPABASE_API_KEY!;
+const USE_JITO = process.env.USE_JITO === "true";
 
 /* =========================
    CONSTANTS
@@ -40,14 +32,11 @@ const PUMP_FUN_PROGRAM = new PublicKey(
 );
 
 const CONFIG = {
-  MAX_RISK_TOTAL: 0.3,
-  MAX_POSITIONS: 8,
   BASE_TRADE_SOL: 0.03,
-  SLIPPAGE_BPS: 200,
   INITIAL_STOP: 0.15,
   TRAILING_STOP: 0.07,
-  MIN_LP_SOL: 8,
-  MAX_TOP_HOLDER: 18,
+  MIN_EXPECTANCY: -0.02,
+  MIN_TRADES: 6,
 };
 
 /* =========================
@@ -56,104 +45,108 @@ const CONFIG = {
 let connection: Connection;
 let wallet: Keypair;
 let jupiter: ReturnType<typeof createJupiterApiClient>;
-
 const positions = new Map<string, any>();
-const copyListeners = new Map<string, number>();
+const presignedCache = new Map<string, VersionedTransaction>();
+
+/* =========================
+   DB (PERSISTENT ANALYTICS)
+========================= */
+const db = new Database("trades.db");
+db.exec(`
+CREATE TABLE IF NOT EXISTS stats (
+  source TEXT PRIMARY KEY,
+  trades INTEGER,
+  wins INTEGER,
+  losses INTEGER,
+  pnl REAL
+)`);
 
 /* =========================
    UTILS
 ========================= */
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
-const now = () => new Date().toLocaleTimeString();
 
 /* =========================
    INIT
 ========================= */
 async function init() {
-  connection = new Connection(RPC_URL, {
-    commitment: "processed" as Commitment,
-  });
-
+  connection = new Connection(RPC_URL, { commitment: "processed" as Commitment });
   wallet = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
   jupiter = createJupiterApiClient({
     apiKey: JUPITER_API_KEY,
     basePath: "https://quote-api.jup.ag/v6",
   });
-
-  console.log(`🚀 Wallet: ${wallet.publicKey.toBase58()}`);
+  console.log(`🚀 Wallet ${wallet.publicKey.toBase58()}`);
 }
 
 /* =========================
-   PRICE (FIXED)
+   EXPECTANCY + AUTO-DISABLE
 ========================= */
-async function getSOLNormalizedPrice(mint: PublicKey): Promise<number> {
-  try {
-    const solIn = 0.1 * LAMPORTS_PER_SOL;
-
-    const quote = await jupiter.quoteGet({
-      inputMint: SOL_MINT,
-      outputMint: mint.toBase58(),
-      amount: solIn,
-      slippageBps: 50,
-    });
-
-    if ("error" in quote) return 0;
-    return solIn / Number(quote.outAmount);
-  } catch {
-    return 0;
+function recordTrade(source: string, pnl: number) {
+  const row = db.prepare(`SELECT * FROM stats WHERE source=?`).get(source);
+  if (!row) {
+    db.prepare(`INSERT INTO stats VALUES (?,?,?,?,?)`)
+      .run(source, 1, pnl > 0 ? 1 : 0, pnl <= 0 ? 1 : 0, pnl);
+  } else {
+    db.prepare(`
+      UPDATE stats SET
+      trades=trades+1,
+      wins=wins+?,
+      losses=losses+?,
+      pnl=pnl+?
+      WHERE source=?
+    `).run(pnl > 0 ? 1 : 0, pnl <= 0 ? 1 : 0, pnl, source);
   }
 }
 
-/* =========================
-   RUG HEURISTICS
-========================= */
-async function advancedRugCheck(mint: PublicKey): Promise<boolean> {
-  try {
-    const mintAcc = await connection.getParsedAccountInfo(mint);
-    const info: any = mintAcc.value?.data;
-    if (!info) return true;
+function expectancy(source: string): number {
+  const s = db.prepare(`SELECT * FROM stats WHERE source=?`).get(source);
+  if (!s || s.trades < CONFIG.MIN_TRADES) return 1;
+  return (s.wins / s.trades) * (s.pnl / s.wins || -0.01);
+}
 
-    if (info.parsed.info.mintAuthority !== null) return true;
-    if (info.parsed.info.freezeAuthority !== null) return true;
-
-    const dex = await fetch(
-      `https://api.dexscreener.com/latest/dex/tokens/${mint.toBase58()}`
-    ).then(r => r.json());
-
-    const pair = dex.pairs?.[0];
-    if (!pair) return true;
-
-    if (pair.liquidity.usd / pair.priceNative < CONFIG.MIN_LP_SOL) return true;
-    if (pair.topHolders?.[0]?.percent > CONFIG.MAX_TOP_HOLDER) return true;
-
-    return false;
-  } catch {
-    return true;
-  }
+function walletDisabled(source: string): boolean {
+  const s = db.prepare(`SELECT * FROM stats WHERE source=?`).get(source);
+  if (!s || s.trades < CONFIG.MIN_TRADES) return false;
+  return expectancy(source) < CONFIG.MIN_EXPECTANCY;
 }
 
 /* =========================
-   SWAP
+   PRICE (SOL NORMALIZED)
 ========================= */
-async function swap(
-  inMint: string,
-  outMint: string,
-  lamports: number,
-  testMode: boolean
-) {
-  if (testMode) {
-    console.log(`[TEST] Swap ${lamports}`);
-    return true;
-  }
-
-  const quote = await jupiter.quoteGet({
-    inputMint: inMint,
-    outputMint: outMint,
-    amount: lamports,
-    slippageBps: CONFIG.SLIPPAGE_BPS,
+async function getPrice(mint: PublicKey): Promise<number> {
+  const solIn = 0.1 * LAMPORTS_PER_SOL;
+  const q = await jupiter.quoteGet({
+    inputMint: SOL_MINT,
+    outputMint: mint.toBase58(),
+    amount: solIn,
+    slippageBps: 50,
   });
+  if ("error" in q) return 0;
+  return solIn / Number(q.outAmount);
+}
 
-  if ("error" in quote) return false;
+/* =========================
+   JITO / PRIVATE EXECUTION
+========================= */
+async function sendTx(tx: VersionedTransaction) {
+  // 🔐 Hook for Jito block-engine
+  await connection.sendRawTransaction(tx.serialize(), {
+    skipPreflight: USE_JITO,
+  });
+}
+
+/* =========================
+   PRE-SIGNED TX CACHE
+========================= */
+async function buildPresignedBuy(mint: PublicKey) {
+  const quote = await jupiter.quoteGet({
+    inputMint: SOL_MINT,
+    outputMint: mint.toBase58(),
+    amount: CONFIG.BASE_TRADE_SOL * LAMPORTS_PER_SOL,
+    slippageBps: 150,
+  });
+  if ("error" in quote) return;
 
   const { swapTransaction } = await jupiter.swapPost({
     swapRequest: {
@@ -167,31 +160,27 @@ async function swap(
     Buffer.from(swapTransaction, "base64")
   );
   tx.sign([wallet]);
-  await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true });
-  return true;
+  presignedCache.set(mint.toBase58(), tx);
 }
 
 /* =========================
    BUY
 ========================= */
 async function buy(mint: PublicKey, source: string, testMode: boolean) {
+  if (walletDisabled(source)) return;
   if (positions.has(mint.toBase58())) return;
 
-  if (await advancedRugCheck(mint)) {
-    console.log(`🚫 Rug blocked ${mint.toBase58().slice(0, 6)}`);
-    return;
+  const sizeMult = Math.min(1.5, Math.max(0.5, expectancy(source)));
+  const price = await getPrice(mint);
+  if (!price) return;
+
+  let tx = presignedCache.get(mint.toBase58());
+  if (!tx) {
+    await buildPresignedBuy(mint);
+    tx = presignedCache.get(mint.toBase58());
   }
 
-  const ok = await swap(
-    SOL_MINT,
-    mint.toBase58(),
-    CONFIG.BASE_TRADE_SOL * LAMPORTS_PER_SOL,
-    testMode
-  );
-
-  if (!ok) return;
-
-  const price = await getSOLNormalizedPrice(mint);
+  if (!testMode && tx) await sendTx(tx);
 
   positions.set(mint.toBase58(), {
     mint,
@@ -199,9 +188,10 @@ async function buy(mint: PublicKey, source: string, testMode: boolean) {
     high: price,
     stop: price * (1 - CONFIG.INITIAL_STOP),
     source,
+    sizeMult,
   });
 
-  console.log(`🛒 BUY ${mint.toBase58().slice(0, 6)} @ ${price}`);
+  console.log(`🛒 BUY ${mint.toBase58().slice(0, 6)} via ${source}`);
 }
 
 /* =========================
@@ -209,18 +199,13 @@ async function buy(mint: PublicKey, source: string, testMode: boolean) {
 ========================= */
 async function manage(testMode: boolean) {
   for (const [k, pos] of positions) {
-    const price = await getSOLNormalizedPrice(pos.mint);
+    const price = await getPrice(pos.mint);
     if (!price) continue;
 
     if (price <= pos.stop) {
-      console.log(`🛑 STOP ${k.slice(0, 6)}`);
-      await swap(
-        pos.mint.toBase58(),
-        SOL_MINT,
-        1_000_000,
-        testMode
-      );
+      recordTrade(pos.source, price - pos.entry);
       positions.delete(k);
+      console.log(`🛑 EXIT ${k.slice(0, 6)}`);
       continue;
     }
 
@@ -232,51 +217,25 @@ async function manage(testMode: boolean) {
 }
 
 /* =========================
-   SIGNATURE COPY TRADING
+   COPY + PUMP.FUN
 ========================= */
-function startCopyWallet(walletAddr: string, testMode: boolean) {
-  const pubkey = new PublicKey(walletAddr);
-
-  const sub = connection.onLogs(pubkey, async logs => {
-    if (!logs.logs.some(l => l.includes("Swap"))) return;
-
-    const tx = await connection.getParsedTransaction(logs.signature, {
-      maxSupportedTransactionVersion: 0,
-    });
-
-    if (!tx) return;
-
-    for (const ix of tx.transaction.message.instructions) {
-      if ("parsed" in ix && ix.parsed?.info?.mint) {
-        await buy(new PublicKey(ix.parsed.info.mint), "COPY_SIG", testMode);
-      }
-    }
+function startCopyWallet(addr: string, testMode: boolean) {
+  const pub = new PublicKey(addr);
+  connection.onLogs(pub, async l => {
+    if (!l.logs.some(x => x.includes("Swap"))) return;
+    const tx = await connection.getParsedTransaction(l.signature);
+    const mint = tx?.meta?.postTokenBalances?.[0]?.mint;
+    if (mint) await buy(new PublicKey(mint), `COPY_${addr.slice(0, 6)}`, testMode);
   });
-
-  copyListeners.set(walletAddr, sub);
 }
 
-/* =========================
-   SUB-SECOND PUMP.FUN SNIPER
-========================= */
 function startPumpSniper(testMode: boolean) {
-  connection.onLogs(
-    PUMP_FUN_PROGRAM,
-    async logs => {
-      if (
-        logs.logs.some(l => l.includes("InitializeMint")) &&
-        logs.logs.some(l => l.includes("AddLiquidity"))
-      ) {
-        const tx = await connection.getParsedTransaction(logs.signature);
-        const mint =
-          tx?.meta?.postTokenBalances?.[0]?.mint;
-        if (mint) {
-          await buy(new PublicKey(mint), "PUMP_FAST", testMode);
-        }
-      }
-    },
-    "processed"
-  );
+  connection.onLogs(PUMP_FUN_PROGRAM, async l => {
+    if (!l.logs.some(x => x.includes("InitializeMint"))) return;
+    const tx = await connection.getParsedTransaction(l.signature);
+    const mint = tx?.meta?.postTokenBalances?.[0]?.mint;
+    if (mint) await buy(new PublicKey(mint), "PUMP_FAST", testMode);
+  });
 }
 
 /* =========================
@@ -284,14 +243,14 @@ function startPumpSniper(testMode: boolean) {
 ========================= */
 async function run() {
   await init();
-  let testMode = true;
+  const testMode = true;
 
   startPumpSniper(testMode);
   startCopyWallet("PASTE_SMART_WALLET", testMode);
 
   while (true) {
     await manage(testMode);
-    await sleep(2500);
+    await sleep(2000);
   }
 }
 

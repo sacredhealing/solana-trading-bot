@@ -1,5 +1,6 @@
 // =====================================================
-// SOLANA SNIPER BOT — LOVABLE CONTROLLED (HEADLESS SAFE)
+// SOLANA MEME SNIPER – STABLE CORE (LIVE READY)
+// Pump.fun | Signature Copy | Auto-Discovery | Lovable
 // =====================================================
 
 import {
@@ -8,209 +9,204 @@ import {
   PublicKey,
   VersionedTransaction,
   LAMPORTS_PER_SOL,
+  Commitment,
 } from "@solana/web3.js";
 import bs58 from "bs58";
-import fetch from "node-fetch";
 import { createJupiterApiClient } from "@jup-ag/api";
+import fetch from "node-fetch";
 
-/* =========================
-   ENV
-========================= */
+// ================= ENV =================
 const RPC_URL = process.env.SOLANA_RPC_URL!;
 const PRIVATE_KEY = process.env.SOLANA_PRIVATE_KEY!;
-const LOVABLE_URL = process.env.LOVABLE_CONTROL_URL!;
-const SUPABASE_KEY = process.env.SUPABASE_API_KEY!;
-const JUPITER_API_KEY = process.env.JUPITER_API_KEY;
+const JUPITER_API_KEY = process.env.JUPITER_API_KEY!;
+const LOVABLE_CONTROL_URL = process.env.LOVABLE_CONTROL_URL!;
+const LOVABLE_LOG_URL = process.env.LOVABLE_LOG_URL!;
 
-/* =========================
-   CONSTANTS
-========================= */
+// ================= CONSTANTS =================
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const PUMP_FUN_PROGRAM = new PublicKey(
   "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 );
 
 const CONFIG = {
-  TRADE_SOL: 0.03,
-  STOP_LOSS: 0.25,
-  TRAILING_STOP: 0.12,
-  CONTROL_POLL_MS: 3000,
+  BASE_SOL: 0.03,
+  STOP_LOSS: 0.15,
+  TRAILING_STOP: 0.07,
+  MANAGE_INTERVAL: 2000,
 };
 
-/* =========================
-   STATE
-========================= */
+// ================= STATE =================
 let connection: Connection;
 let wallet: Keypair;
 let jupiter: ReturnType<typeof createJupiterApiClient>;
-
-let botRunning = false;
-let testMode = true;
-let sniperActive = false;
+let running = false;
 
 const positions = new Map<string, any>();
+const knownSmartWallets = new Set<string>();
+const discoveredWallets = new Map<string, number>(); // wallet -> wins
 
-/* =========================
-   INIT
-========================= */
+// ================= INIT =================
 async function init() {
-  connection = new Connection(RPC_URL, "processed");
+  const decoded = bs58.decode(PRIVATE_KEY);
+  if (decoded.length !== 64) throw new Error("Invalid private key");
 
-  const key = bs58.decode(PRIVATE_KEY);
-  if (key.length !== 64) throw new Error("Bad private key size");
+  wallet = Keypair.fromSecretKey(decoded);
+  connection = new Connection(RPC_URL, { commitment: "processed" as Commitment });
+  jupiter = createJupiterApiClient({
+    apiKey: JUPITER_API_KEY,
+    basePath: "https://quote-api.jup.ag/v6",
+  });
 
-  wallet = Keypair.fromSecretKey(key);
-  jupiter = createJupiterApiClient({ apiKey: JUPITER_API_KEY });
-
-  console.log("🤖 BOT ONLINE");
-  console.log("Wallet:", wallet.publicKey.toBase58());
+  console.log("🚀 Wallet:", wallet.publicKey.toBase58());
 }
 
-/* =========================
-   LOVABLE CONTROL
-========================= */
+// ================= LOVABLE =================
 async function fetchControl() {
+  const res = await fetch(LOVABLE_CONTROL_URL);
+  return res.ok ? res.json() : null;
+}
+
+async function logLovable(data: any) {
   try {
-    const res = await fetch(LOVABLE_URL, {
-      headers: {
-        apikey: SUPABASE_KEY,
-        Authorization: `Bearer ${SUPABASE_KEY}`,
-      },
+    await fetch(LOVABLE_LOG_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
     });
-    const data = await res.json();
-    return data?.[0] || null;
+  } catch {}
+}
+
+// ================= PRICE =================
+async function getPrice(mint: string): Promise<number> {
+  try {
+    const q = await jupiter.quoteGet({
+      inputMint: SOL_MINT,
+      outputMint: mint,
+      amount: 0.1 * LAMPORTS_PER_SOL,
+      slippageBps: 50,
+    });
+    if ("error" in q) return 0;
+    return (0.1 * LAMPORTS_PER_SOL) / Number(q.outAmount);
   } catch {
-    return null;
+    return 0;
   }
 }
 
-/* =========================
-   PRICE
-========================= */
-async function price(mint: PublicKey): Promise<number> {
-  const q = await jupiter.quoteGet({
-    inputMint: SOL_MINT,
-    outputMint: mint.toBase58(),
-    amount: 0.1 * LAMPORTS_PER_SOL,
-    slippageBps: 50,
-  });
-  if ("error" in q) return 0;
-  return (0.1 * LAMPORTS_PER_SOL) / Number(q.outAmount);
-}
+// ================= BUY =================
+async function buy(mint: string, source: string, testMode: boolean) {
+  if (positions.has(mint)) return;
 
-/* =========================
-   BUY
-========================= */
-async function buy(mint: PublicKey) {
-  if (positions.has(mint.toBase58())) return;
+  const price = await getPrice(mint);
+  if (!price) return;
 
-  if (testMode) {
-    console.log("🟡 TEST BUY", mint.toBase58().slice(0, 6));
-    positions.set(mint.toBase58(), { mint, entry: 1, high: 1, stop: 0.75 });
-    return;
+  if (!testMode) {
+    const quote = await jupiter.quoteGet({
+      inputMint: SOL_MINT,
+      outputMint: mint,
+      amount: CONFIG.BASE_SOL * LAMPORTS_PER_SOL,
+      slippageBps: 200,
+    });
+    if (!("error" in quote)) {
+      const { swapTransaction } = await jupiter.swapPost({
+        swapRequest: {
+          quoteResponse: quote,
+          userPublicKey: wallet.publicKey.toBase58(),
+          wrapAndUnwrapSol: true,
+        },
+      });
+      const tx = VersionedTransaction.deserialize(
+        Buffer.from(swapTransaction, "base64")
+      );
+      tx.sign([wallet]);
+      await connection.sendRawTransaction(tx.serialize());
+    }
   }
 
-  const q = await jupiter.quoteGet({
-    inputMint: SOL_MINT,
-    outputMint: mint.toBase58(),
-    amount: CONFIG.TRADE_SOL * LAMPORTS_PER_SOL,
-    slippageBps: 300,
-  });
-  if ("error" in q) return;
-
-  const { swapTransaction } = await jupiter.swapPost({
-    swapRequest: {
-      quoteResponse: q,
-      userPublicKey: wallet.publicKey.toBase58(),
-      wrapAndUnwrapSol: true,
-    },
-  });
-
-  const tx = VersionedTransaction.deserialize(
-    Buffer.from(swapTransaction, "base64")
-  );
-  tx.sign([wallet]);
-  await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true });
-
-  const p = await price(mint);
-  positions.set(mint.toBase58(), {
+  positions.set(mint, {
     mint,
-    entry: p,
-    high: p,
-    stop: p * (1 - CONFIG.STOP_LOSS),
+    entry: price,
+    high: price,
+    stop: price * (1 - CONFIG.STOP_LOSS),
+    source,
   });
 
-  console.log("🛒 LIVE BUY", mint.toBase58().slice(0, 6));
+  await logLovable({ type: "BUY", mint, source, testMode });
+  console.log("🛒 BUY", mint.slice(0, 6), source);
 }
 
-/* =========================
-   POSITION MANAGER
-========================= */
-async function manage() {
-  for (const [k, p] of positions) {
-    const pr = await price(p.mint);
-    if (!pr) continue;
+// ================= MANAGER =================
+async function manage(testMode: boolean) {
+  for (const [mint, pos] of positions) {
+    const price = await getPrice(mint);
+    if (!price) continue;
 
-    if (pr <= p.stop) {
-      console.log("🔴 EXIT", k.slice(0, 6));
-      positions.delete(k);
+    if (price <= pos.stop) {
+      positions.delete(mint);
+      await logLovable({ type: "SELL", mint, reason: "STOP" });
+      console.log("🛑 EXIT", mint.slice(0, 6));
       continue;
     }
 
-    if (pr > p.high) {
-      p.high = pr;
-      p.stop = pr * (1 - CONFIG.TRAILING_STOP);
+    if (price > pos.high) {
+      pos.high = price;
+      pos.stop = price * (1 - CONFIG.TRAILING_STOP);
     }
   }
 }
 
-/* =========================
-   PUMP.FUN LISTENER
-========================= */
-function startSniper() {
-  if (sniperActive) return;
-
-  connection.onLogs(PUMP_FUN_PROGRAM, async (l) => {
-    if (!botRunning) return;
-    if (!l.logs.some((x) => x.includes("InitializeMint"))) return;
+// ================= PUMP.FUN =================
+function startPumpSniper(testMode: boolean) {
+  connection.onLogs(PUMP_FUN_PROGRAM, async l => {
+    if (!running) return;
+    if (!l.logs.some(x => x.includes("InitializeMint"))) return;
 
     const tx = await connection.getParsedTransaction(l.signature);
     const mint = tx?.meta?.postTokenBalances?.[0]?.mint;
-    if (mint) await buy(new PublicKey(mint));
+    if (mint) await buy(mint, "PUMP", testMode);
   });
-
-  sniperActive = true;
-  console.log("🎯 SNIPER ACTIVE");
 }
 
-/* =========================
-   MAIN LOOP
-========================= */
+// ================= COPY (SIGNATURE BASED) =================
+function startCopy(walletAddr: string, testMode: boolean) {
+  const pub = new PublicKey(walletAddr);
+  connection.onLogs(pub, async l => {
+    if (!running) return;
+    const tx = await connection.getParsedTransaction(l.signature);
+    const mint = tx?.meta?.postTokenBalances?.[0]?.mint;
+    if (mint) {
+      await buy(mint, `COPY_${walletAddr.slice(0, 6)}`, testMode);
+      discoveredWallets.set(walletAddr, (discoveredWallets.get(walletAddr) || 0) + 1);
+    }
+  });
+}
+
+// ================= MAIN =================
 async function run() {
   await init();
-  startSniper();
 
   while (true) {
     const control = await fetchControl();
-
     if (!control || control.status !== "RUNNING") {
-      if (botRunning) console.log("⏸️ BOT PAUSED");
-      botRunning = false;
-    } else {
-      botRunning = true;
-      testMode = control.testMode ?? true;
+      running = false;
+      await new Promise(r => setTimeout(r, 5000));
+      continue;
     }
 
-    if (botRunning) {
-      await manage();
-      console.log(
-        testMode ? "🟡 TEST MODE" : "🟢 LIVE MODE",
-        "| Positions:",
-        positions.size
-      );
+    running = true;
+    const testMode = control.testMode ?? true;
+
+    if (control.copyTrading?.wallets) {
+      for (const w of control.copyTrading.wallets) {
+        if (!knownSmartWallets.has(w)) {
+          knownSmartWallets.add(w);
+          startCopy(w, testMode);
+        }
+      }
     }
 
-    await new Promise((r) => setTimeout(r, CONFIG.CONTROL_POLL_MS));
+    startPumpSniper(testMode);
+    await manage(testMode);
+    await new Promise(r => setTimeout(r, CONFIG.MANAGE_INTERVAL));
   }
 }
 

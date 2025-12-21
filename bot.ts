@@ -1,35 +1,34 @@
 // =====================================================
-// ULTIMATE SOLANA MEME SNIPER BOT 2025 – LIVE READY
-// Fixes:
-// 1) Log raw Lovable control payload
-// 2) Robust copyTrading.wallets parsing
-// 3) Correct pump.fun mint extraction
-// 4) Lovable heartbeat updates
-// 5) Strict testMode enforcement (LIVE only if boolean false)
+// TOP 1% SOLANA MEME BOT – ENDGAME EDITION
+// Jito Bundles | Signature Copy | Smart Discovery | Multi-Wallet
 // =====================================================
 
 import {
   Connection,
   Keypair,
+  PublicKey,
   VersionedTransaction,
   LAMPORTS_PER_SOL,
-  PublicKey,
   Commitment,
 } from "@solana/web3.js";
 import bs58 from "bs58";
-import fetch from "node-fetch";
 import { createJupiterApiClient } from "@jup-ag/api";
-import Database from "better-sqlite3";
 
 /* =========================
    ENV
 ========================= */
 const RPC_URL = process.env.SOLANA_RPC_URL!;
-const PRIVATE_KEY = process.env.SOLANA_PRIVATE_KEY!;
+const JITO_RPC_URL = process.env.JITO_RPC_URL || ""; // optional
+const JITO_AUTH_KEY = process.env.JITO_AUTH_KEY || "";
 const JUPITER_API_KEY = process.env.JUPITER_API_KEY!;
 const LOVABLE_CONTROL_URL = process.env.LOVABLE_CONTROL_URL!;
-const LOVABLE_TELEMETRY_URL = process.env.LOVABLE_TELEMETRY_URL!;
-const USE_JITO = process.env.USE_JITO === "true";
+const LOVABLE_LOG_URL = process.env.LOVABLE_API_URL!;
+const SUPABASE_API_KEY = process.env.SUPABASE_API_KEY!;
+
+// MULTI WALLET
+const WALLET_KEYS = (process.env.SOLANA_PRIVATE_KEYS || "")
+  .split(",")
+  .map(k => Keypair.fromSecretKey(bs58.decode(k)));
 
 /* =========================
    CONSTANTS
@@ -40,349 +39,192 @@ const PUMP_FUN_PROGRAM = new PublicKey(
 );
 
 const CONFIG = {
-  BASE_TRADE_SOL: 0.03,
-  INITIAL_STOP: 0.15,
-  TRAILING_STOP: 0.07,
-  MIN_EXPECTANCY: -0.02,
-  MIN_TRADES: 6,
-  HEARTBEAT_MS: 10000,
+  BASE_SOL: 0.03,
+  INITIAL_STOP: 0.18,
+  TRAILING_STOP: 0.08,
+  MIN_TOKEN_AGE_MS: 60_000,
+  MAIN_LOOP_MS: 2000,
 };
 
 /* =========================
    STATE
 ========================= */
-let connection: Connection;
-let wallet: Keypair;
-let jupiter: ReturnType<typeof createJupiterApiClient>;
-const positions = new Map<
-  string,
-  {
-    mint: PublicKey;
-    entry: number;
-    high: number;
-    stop: number;
-    source: string;
-    sizeMult: number;
-    lastPrice?: number;
-  }
->();
-const presignedCache = new Map<string, VersionedTransaction>();
-let lastHeartbeat = 0;
+const connection = new Connection(RPC_URL, {
+  commitment: "processed" as Commitment,
+});
 
-/* =========================
-   DB (PERSISTENT ANALYTICS)
-========================= */
-const db = new Database("trades.db");
-db.exec(`
-CREATE TABLE IF NOT EXISTS stats (
-  source TEXT PRIMARY KEY,
-  trades INTEGER,
-  wins INTEGER,
-  losses INTEGER,
-  pnl REAL
-)`);
+const jupiter = createJupiterApiClient({ apiKey: JUPITER_API_KEY });
+
+let walletIndex = 0;
+const positions = new Map<string, any>();
+const smartWallets = new Map<string, { trades: number; pnl: number }>();
+const copyListeners = new Map<string, number>();
 
 /* =========================
    UTILS
 ========================= */
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+const log = (...a: any[]) => console.log(new Date().toLocaleTimeString(), ...a);
 
-async function getLovableControl(): Promise<any> {
-  const res = await fetch(LOVABLE_CONTROL_URL, { method: "GET" });
-  const json = await res.json();
-  // 1️⃣ LOG RAW CONTROL PAYLOAD
-  console.log("📡 RAW LOVABLE CONTROL:", JSON.stringify(json, null, 2));
-  return json;
+function nextWallet(): Keypair {
+  const w = WALLET_KEYS[walletIndex % WALLET_KEYS.length];
+  walletIndex++;
+  return w;
 }
 
-async function postLovable(payload: any) {
+/* =========================
+   JITO BUNDLE SEND (OPTIONAL)
+========================= */
+async function sendBundle(tx: VersionedTransaction): Promise<boolean> {
+  if (!JITO_RPC_URL || !JITO_AUTH_KEY) return false;
+
   try {
-    await fetch(LOVABLE_TELEMETRY_URL, {
+    await fetch(JITO_RPC_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${JITO_AUTH_KEY}`,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "sendBundle",
+        params: [[tx.serialize().toString("base64")]],
+      }),
     });
-  } catch (e) {
-    console.warn("Lovable telemetry failed:", (e as Error).message);
+    log("🧱 JITO BUNDLE SENT");
+    return true;
+  } catch {
+    return false;
   }
 }
 
 /* =========================
-   INIT
+   TOKEN AGE CHECK
 ========================= */
-async function init() {
-  connection = new Connection(RPC_URL, { commitment: "processed" as Commitment });
-  wallet = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
-  jupiter = createJupiterApiClient({
-    apiKey: JUPITER_API_KEY,
-    basePath: "https://quote-api.jup.ag/v6",
-  });
-  console.log(`🚀 Wallet ${wallet.publicKey.toBase58()}`);
-}
-
-/* =========================
-   EXPECTANCY + AUTO-DISABLE
-========================= */
-function recordTrade(source: string, pnl: number) {
-  const row = db.prepare(`SELECT * FROM stats WHERE source=?`).get(source);
-  if (!row) {
-    db.prepare(`INSERT INTO stats VALUES (?,?,?,?,?)`)
-      .run(source, 1, pnl > 0 ? 1 : 0, pnl <= 0 ? 1 : 0, pnl);
-  } else {
-    db.prepare(`
-      UPDATE stats SET
-      trades=trades+1,
-      wins=wins+?,
-      losses=losses+?,
-      pnl=pnl+?
-      WHERE source=?
-    `).run(pnl > 0 ? 1 : 0, pnl <= 0 ? 1 : 0, pnl, source);
-  }
-}
-
-function expectancy(source: string): number {
-  const s = db.prepare(`SELECT * FROM stats WHERE source=?`).get(source);
-  if (!s || s.trades < CONFIG.MIN_TRADES) return 1;
-  return (s.wins / s.trades) * (s.pnl / Math.max(s.wins, 1));
-}
-
-function walletDisabled(source: string): boolean {
-  const s = db.prepare(`SELECT * FROM stats WHERE source=?`).get(source);
-  if (!s || s.trades < CONFIG.MIN_TRADES) return false;
-  return expectancy(source) < CONFIG.MIN_EXPECTANCY;
-}
-
-/* =========================
-   PRICE (SOL NORMALIZED)
-========================= */
-async function getPrice(mint: PublicKey): Promise<number> {
-  const solIn = 0.1 * LAMPORTS_PER_SOL;
-  const q = await jupiter.quoteGet({
-    inputMint: SOL_MINT,
-    outputMint: mint.toBase58(),
-    amount: solIn,
-    slippageBps: 50,
-  });
-  if ("error" in q) return 0;
-  return solIn / Number(q.outAmount);
-}
-
-/* =========================
-   JITO / PRIVATE EXECUTION (HOOK)
-========================= */
-async function sendTx(tx: VersionedTransaction) {
-  await connection.sendRawTransaction(tx.serialize(), {
-    skipPreflight: USE_JITO,
-  });
-}
-
-/* =========================
-   PRE-SIGNED TX CACHE
-========================= */
-async function buildPresignedBuy(mint: PublicKey) {
-  const quote = await jupiter.quoteGet({
-    inputMint: SOL_MINT,
-    outputMint: mint.toBase58(),
-    amount: CONFIG.BASE_TRADE_SOL * LAMPORTS_PER_SOL,
-    slippageBps: 150,
-  });
-  if ("error" in quote) return;
-
-  const { swapTransaction } = await jupiter.swapPost({
-    swapRequest: {
-      quoteResponse: quote,
-      userPublicKey: wallet.publicKey.toBase58(),
-      wrapAndUnwrapSol: true,
-    },
-  });
-
-  const tx = VersionedTransaction.deserialize(
-    Buffer.from(swapTransaction, "base64")
-  );
-  tx.sign([wallet]);
-  presignedCache.set(mint.toBase58(), tx);
+async function isOld(mint: PublicKey): Promise<boolean> {
+  const sigs = await connection.getSignaturesForAddress(mint, { limit: 1 });
+  if (!sigs.length || !sigs[0].blockTime) return true;
+  return Date.now() - sigs[0].blockTime * 1000 > CONFIG.MIN_TOKEN_AGE_MS;
 }
 
 /* =========================
    BUY
 ========================= */
-async function buy(mint: PublicKey, source: string, testMode: boolean) {
-  if (walletDisabled(source)) return;
+async function buy(mint: PublicKey, source: string, test: boolean) {
   if (positions.has(mint.toBase58())) return;
+  if (await isOld(mint)) return;
 
-  const sizeMult = Math.min(1.5, Math.max(0.5, expectancy(source)));
-  const price = await getPrice(mint);
-  if (!price) return;
+  const wallet = nextWallet();
+  log("🛒 BUY", mint.toBase58(), "via", source, wallet.publicKey.toBase58());
 
-  let tx = presignedCache.get(mint.toBase58());
-  if (!tx) {
-    await buildPresignedBuy(mint);
-    tx = presignedCache.get(mint.toBase58());
+  if (!test) {
+    const q = await jupiter.quoteGet({
+      inputMint: SOL_MINT,
+      outputMint: mint.toBase58(),
+      amount: CONFIG.BASE_SOL * LAMPORTS_PER_SOL,
+      slippageBps: 200,
+    });
+    if ("error" in q) return;
+
+    const { swapTransaction } = await jupiter.swapPost({
+      swapRequest: {
+        quoteResponse: q,
+        userPublicKey: wallet.publicKey.toBase58(),
+        wrapAndUnwrapSol: true,
+      },
+    });
+
+    const tx = VersionedTransaction.deserialize(
+      Buffer.from(swapTransaction, "base64")
+    );
+    tx.sign([wallet]);
+
+    if (!(await sendBundle(tx))) {
+      await connection.sendRawTransaction(tx.serialize());
+    }
   }
-
-  if (!testMode && tx) await sendTx(tx);
 
   positions.set(mint.toBase58(), {
     mint,
-    entry: price,
-    high: price,
-    stop: price * (1 - CONFIG.INITIAL_STOP),
+    wallet: wallet.publicKey.toBase58(),
+    entryTime: Date.now(),
     source,
-    sizeMult,
-    lastPrice: price,
   });
-
-  await postLovable({
-    type: "BUY",
-    mint: mint.toBase58(),
-    source,
-    price,
-    testMode,
-  });
-
-  console.log(`🛒 BUY ${mint.toBase58().slice(0, 6)} via ${source}`);
 }
 
 /* =========================
-   POSITION MANAGER
+   SIGNATURE COPY TRADING
 ========================= */
-async function manage(testMode: boolean) {
-  for (const [k, pos] of positions) {
-    const price = await getPrice(pos.mint);
-    if (!price) continue;
-    pos.lastPrice = price;
+function followWallet(addr: string, test: boolean) {
+  if (copyListeners.has(addr)) return;
 
-    if (price <= pos.stop) {
-      recordTrade(pos.source, price - pos.entry);
-      positions.delete(k);
+  const sub = connection.onLogs(new PublicKey(addr), async l => {
+    const tx = await connection.getParsedTransaction(l.signature, {
+      maxSupportedTransactionVersion: 0,
+    });
+    const mint =
+      tx?.meta?.postTokenBalances?.find(b => b.owner !== addr)?.mint;
+    if (mint) await buy(new PublicKey(mint), `COPY_${addr.slice(0, 6)}`, test);
+  });
 
-      await postLovable({
-        type: "SELL",
-        mint: k,
-        price,
-        pnl: price - pos.entry,
-        testMode,
-      });
+  copyListeners.set(addr, sub);
+  log("👀 FOLLOWING SMART WALLET", addr);
+}
 
-      console.log(`🛑 EXIT ${k.slice(0, 6)}`);
-      continue;
-    }
+/* =========================
+   SMART WALLET DISCOVERY
+========================= */
+async function discoverWallet(addr: string, pnl: number) {
+  const s = smartWallets.get(addr) || { trades: 0, pnl: 0 };
+  s.trades++;
+  s.pnl += pnl;
+  smartWallets.set(addr, s);
 
-    if (price > pos.high) {
-      pos.high = price;
-      pos.stop = price * (1 - CONFIG.TRAILING_STOP);
-    }
+  if (s.trades >= 5 && s.pnl > 0) {
+    followWallet(addr, false);
   }
-}
-
-/* =========================
-   COPY TRADING
-========================= */
-function parseCopyWallets(control: any): string[] {
-  // 2️⃣ ROBUST PARSING
-  return (
-    control?.copyTrading?.wallets ||
-    control?.copy_wallets ||
-    control?.wallets ||
-    []
-  );
-}
-
-function startCopyWallet(addr: string, testMode: boolean) {
-  const pub = new PublicKey(addr);
-  connection.onLogs(pub, async l => {
-    if (!l.logs.some(x => x.includes("Swap"))) return;
-    const tx = await connection.getParsedTransaction(l.signature);
-    const mint = tx?.meta?.postTokenBalances?.find(
-      b => b.mint && b.mint !== SOL_MINT
-    )?.mint;
-    if (mint) await buy(new PublicKey(mint), `COPY_${addr.slice(0, 6)}`, testMode);
-  });
 }
 
 /* =========================
    PUMP.FUN SNIPER
 ========================= */
-function startPumpSniper(testMode: boolean) {
+function startPump(test: boolean) {
   connection.onLogs(PUMP_FUN_PROGRAM, async l => {
     if (!l.logs.some(x => x.includes("InitializeMint"))) return;
     const tx = await connection.getParsedTransaction(l.signature);
-    // 3️⃣ CORRECT MINT EXTRACTION
-    const mint = tx?.meta?.postTokenBalances?.find(
-      b => b.mint && b.mint !== SOL_MINT
-    )?.mint;
-    if (mint) await buy(new PublicKey(mint), "PUMP_FAST", testMode);
+    const mint = tx?.meta?.postTokenBalances?.[0]?.mint;
+    if (mint) await buy(new PublicKey(mint), "PUMP", test);
   });
 }
 
 /* =========================
-   HEARTBEAT
-========================= */
-async function heartbeat(testMode: boolean) {
-  const now = Date.now();
-  if (now - lastHeartbeat < CONFIG.HEARTBEAT_MS) return;
-  lastHeartbeat = now;
-
-  await postLovable({
-    type: "HEARTBEAT",
-    status: "RUNNING",
-    testMode,
-    wallet: wallet.publicKey.toBase58(),
-    positions: [...positions.values()].map(p => ({
-      mint: p.mint.toBase58(),
-      entry: p.entry,
-      last: p.lastPrice,
-      stop: p.stop,
-      source: p.source,
-    })),
-  });
-}
-
-/* =========================
-   MAIN
+   MAIN LOOP
 ========================= */
 async function run() {
-  await init();
+  log("🚀 BOT STARTED | Wallets:", WALLET_KEYS.length);
 
-  let pumpStarted = false;
-  const activeCopyListeners = new Set<string>();
+  let sniper = false;
 
   while (true) {
-    const control = await getLovableControl();
+    try {
+      const c = await fetch(LOVABLE_CONTROL_URL, {
+        headers: { apikey: SUPABASE_API_KEY },
+      }).then(r => r.json());
 
-    // 5️⃣ STRICT testMode
-    if (typeof control?.testMode !== "boolean") {
-      console.warn("⚠️ testMode missing or invalid. Defaulting to TEST.");
-    }
-    const testMode = control?.testMode === false ? false : true;
+      const test = c?.testMode ?? true;
 
-    if (control?.status !== "RUNNING") {
-      await sleep(2000);
-      continue;
-    }
-
-    // Start pump sniper once
-    if (!pumpStarted) {
-      startPumpSniper(testMode);
-      pumpStarted = true;
-    }
-
-    // Copy wallets
-    const wallets = parseCopyWallets(control);
-    for (const w of wallets) {
-      if (!activeCopyListeners.has(w)) {
-        startCopyWallet(w, testMode);
-        activeCopyListeners.add(w);
+      if (!sniper && c?.status === "RUNNING") {
+        startPump(test);
+        sniper = true;
       }
-    }
 
-    await manage(testMode);
-    await heartbeat(testMode);
-    await sleep(2000);
+      await sleep(CONFIG.MAIN_LOOP_MS);
+    } catch (e) {
+      log("❌ LOOP ERROR", e);
+      await sleep(5000);
+    }
   }
 }
 
-run().catch(e => {
-  console.error("Fatal:", e);
-  process.exit(1);
-});
+run();

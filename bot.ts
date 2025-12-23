@@ -155,6 +155,7 @@ let listenerActive = false;
 let listenerSubscriptionId: number | null = null;
 let currentTestMode = true;
 
+// LIVE mode stats (real money)
 const stats: BotStats = {
   totalTrades: 0,
   wins: 0,
@@ -162,6 +163,19 @@ const stats: BotStats = {
   totalPnL: 0,
   startTime: Date.now(),
 };
+
+// TEST mode stats (isolated - never affects real risk)
+const testStats: BotStats = {
+  totalTrades: 0,
+  wins: 0,
+  losses: 0,
+  totalPnL: 0,
+  startTime: Date.now(),
+};
+
+// Starting balance for global hard stop calculation
+let startingBalance = 0;
+const GLOBAL_HARD_STOP_PCT = 0.30; // Stop bot if LIVE losses exceed 30%
 
 // Source performance tracking (in-memory, no DB needed)
 const sourceStats = new Map<string, SourceStats>();
@@ -417,6 +431,8 @@ async function sendHeartbeat(testMode: boolean) {
   lastHeartbeat = now;
 
   const balance = await solBalance();
+  const activeStats = testMode ? testStats : stats;
+  
   const positionsList = [...positions.values()].map(p => ({
     mint: p.mint.toBase58(),
     entry: p.entryPrice,
@@ -433,11 +449,11 @@ async function sendHeartbeat(testMode: boolean) {
     balance,
     positions: positionsList,
     positionCount: positions.size,
-    totalTrades: stats.totalTrades,
-    wins: stats.wins,
-    losses: stats.losses,
-    totalPnL: stats.totalPnL,
-    uptime: Math.floor((Date.now() - stats.startTime) / 1000),
+    totalTrades: activeStats.totalTrades,
+    wins: activeStats.wins,
+    losses: activeStats.losses,
+    totalPnL: activeStats.totalPnL,
+    uptime: Math.floor((Date.now() - activeStats.startTime) / 1000),
   });
 }
 
@@ -733,11 +749,21 @@ async function executeSell(pos: Position, reason: string, testMode: boolean): Pr
   const pnl = exitPrice - pos.entryPrice;
   const pnlPct = ((exitPrice / pos.entryPrice) - 1) * 100;
 
-  stats.totalPnL += pnl * pos.sizeSOL;
-  if (pnl > 0) stats.wins++;
-  else stats.losses++;
+  // CRITICAL FIX: Use separate stats for TEST vs LIVE mode
+  // TEST mode stats are isolated and never trigger real risk controls
+  const activeStats = testMode ? testStats : stats;
+  
+  // Clamp PnL to realistic bounds (can't lose more than 100%)
+  const clampedPnlPct = Math.max(-100, Math.min(1000, pnlPct));
+  const realizedPnL = (clampedPnlPct / 100) * pos.sizeSOL;
+  
+  activeStats.totalPnL += realizedPnL;
+  activeStats.totalTrades++;
+  if (pnl > 0) activeStats.wins++;
+  else activeStats.losses++;
 
-  console.log(`[${timestamp()}] ${pnl > 0 ? '🟢' : '🔴'} PnL: ${pnlPct.toFixed(2)}% | ${(pnl * pos.sizeSOL).toFixed(4)} SOL`);
+  const modeLabel = testMode ? "🧪 TEST" : "🟢 LIVE";
+  console.log(`[${timestamp()}] ${modeLabel} ${pnl > 0 ? '🟢' : '🔴'} PnL: ${clampedPnlPct.toFixed(2)}% | ${realizedPnL.toFixed(4)} SOL`);
 
   // Profit sharing
   if (pnl > 0 && creatorWallet && !testMode && CONFIG.PROFIT_SHARE_PERCENT > 0) {
@@ -990,6 +1016,11 @@ async function run() {
     process.exit(1);
   }
 
+  // Record starting balance for global hard stop
+  startingBalance = await solBalance();
+  log("💰", `Starting balance: ${startingBalance.toFixed(4)} SOL`);
+  log("🛡️", `Global hard stop: -${(GLOBAL_HARD_STOP_PCT * 100).toFixed(0)}% (${(startingBalance * GLOBAL_HARD_STOP_PCT).toFixed(4)} SOL)`);
+
   log("🤖", "Starting main loop...");
   
   // Periodic RPC health check
@@ -1006,6 +1037,17 @@ async function run() {
     try {
       const control = await fetchControl();
       const balance = await solBalance();
+
+      // GLOBAL HARD STOP - LIVE MODE ONLY
+      // If LIVE losses exceed 30% of starting balance, stop the bot
+      if (!currentTestMode && stats.totalPnL < -(startingBalance * GLOBAL_HARD_STOP_PCT)) {
+        log("🛑", `GLOBAL HARD STOP TRIGGERED!`);
+        log("🛑", `LIVE PnL: ${stats.totalPnL.toFixed(4)} SOL exceeded -${(GLOBAL_HARD_STOP_PCT * 100).toFixed(0)}% limit`);
+        stopPumpSniper();
+        await postLovable({ type: "HARD_STOP", reason: "Global PnL limit exceeded", pnl: stats.totalPnL });
+        console.log("🛑 Bot stopped due to global hard stop. Manual restart required.");
+        process.exit(1);
+      }
 
       if (!control || control.status !== "RUNNING") {
         stopPumpSniper();
@@ -1040,9 +1082,10 @@ async function run() {
       // Send heartbeat to sync balance with dashboard
       await sendHeartbeat(testMode);
 
-      // Status log
+      // Status log - show correct stats based on mode
       const mode = testMode ? "🟡 TEST" : "🟢 LIVE";
-      console.log(`[${timestamp()}] ${mode} | Balance: ${balance.toFixed(4)} SOL | Positions: ${positions.size} | Trades: ${stats.totalTrades} | PnL: ${stats.totalPnL.toFixed(4)} SOL`);
+      const activeStats = testMode ? testStats : stats;
+      console.log(`[${timestamp()}] ${mode} | Balance: ${balance.toFixed(4)} SOL | Positions: ${positions.size} | Trades: ${activeStats.totalTrades} | PnL: ${activeStats.totalPnL.toFixed(4)} SOL`);
 
       await sleep(CONFIG.MAIN_LOOP_MS);
 
